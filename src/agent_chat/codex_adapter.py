@@ -20,6 +20,8 @@ from typing import Any
 from . import core
 from .app_server import AppServerClient, AppServerError
 
+INJECTION_BARRIER_TIMEOUT = 10.0
+
 
 @dataclass
 class PendingDelivery:
@@ -33,6 +35,7 @@ class PendingDelivery:
     replied: bool = False
     output_cursor: int = 0
     forwarded_items: set[str] = field(default_factory=set)
+    injected: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 def _codex_program() -> str:
@@ -324,6 +327,7 @@ class CodexAdapter:
             )
         if not any(event["state"] == "injected" for event in detail["delivery"]["events"]):
             return None
+        delivery.injected.set()
         thread = await self._refresh_thread()
         marker = self._marker(delivery.message_id)
         for turn in reversed(thread.get("turns") or []):
@@ -398,6 +402,7 @@ class CodexAdapter:
                     adapter="codex.appserver",
                     host_ref=self.thread_id,
                 )
+            delivery.injected.set()
             await self._replay_delivery(delivery)
 
     async def bridge_loop(self) -> None:
@@ -580,6 +585,15 @@ class CodexAdapter:
         return delivery
 
     @staticmethod
+    async def _await_injected(delivery: PendingDelivery) -> None:
+        try:
+            await asyncio.wait_for(delivery.injected.wait(), timeout=INJECTION_BARRIER_TIMEOUT)
+        except TimeoutError as exc:
+            raise core.ChatError(
+                f"message {delivery.message_id} was not durably injected before the host tool call"
+            ) from exc
+
+    @staticmethod
     def _tool_text(arguments: dict[str, Any]) -> str:
         value = arguments.get("text")
         if not isinstance(value, str) or not value.strip():
@@ -602,6 +616,7 @@ class CodexAdapter:
             arguments = self._tool_arguments(params)
             if tool == "agent_chat_observe":
                 delivery = self._tracked_delivery(arguments)
+                await self._await_injected(delivery)
                 with closing(self._connect()) as connection:
                     result = core.acknowledge(
                         connection,
@@ -613,6 +628,7 @@ class CodexAdapter:
                 delivery.acknowledged = True
             elif tool in ("agent_chat_progress", "agent_chat_reply"):
                 delivery = self._tracked_delivery(arguments)
+                await self._await_injected(delivery)
                 text = self._tool_text(arguments)
                 reply_digest = hashlib.sha256(
                     f"{tool}\0{delivery.message_id}\0{text}".encode("utf-8")
@@ -748,9 +764,8 @@ class CodexAdapter:
                     ttl=self.adapter_lease,
                 )
 
-    async def server_request_loop(self) -> None:
-        while not self.stopping.is_set():
-            request = await self.app.server_requests.get()
+    async def _process_server_request(self, request: dict[str, Any]) -> None:
+        try:
             if request.get("method") == "item/tool/call":
                 await self._handle_dynamic_tool(request)
             else:
@@ -764,6 +779,14 @@ class CodexAdapter:
                         ),
                     },
                 )
+        except AppServerError:
+            self.stopping.set()
+
+    async def server_request_loop(self) -> None:
+        async with asyncio.TaskGroup() as requests:
+            while not self.stopping.is_set():
+                request = await self.app.server_requests.get()
+                requests.create_task(self._process_server_request(request))
 
     async def run(self) -> None:
         tasks: list[asyncio.Task[Any]] = []
