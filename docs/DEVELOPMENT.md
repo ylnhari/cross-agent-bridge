@@ -1,14 +1,13 @@
 # Development guide
 
 This guide gets a contributor from a fresh clone to the same checks enforced by
-CI. The bridge core has no runtime dependencies; Ruff and pre-commit are
-development-only tools.
+CI. The installed product has no runtime package dependencies; Ruff and
+pre-commit are development-only tools.
 
 ## Prerequisites
 
 - Python 3.11 or newer.
 - Git.
-- Node.js 20 or newer only when changing the Claude Channel adapter.
 
 Use a virtual environment so development tools do not alter the system Python:
 
@@ -60,30 +59,24 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
 agent-chat --help
+agent-chat-codex --help
+agent-chat-claude --help
+agent-chat-claude-channel --help
 python -m pip wheel . --no-deps --wheel-dir dist
 ```
 
 On macOS or Linux, use `export PYTHONPATH=src`.
-
-Run the Claude Channel adapter suite when its JavaScript or protocol boundary
-changes:
-
-```powershell
-npm ci --prefix adapters/claude-channel
-npm test --prefix adapters/claude-channel
-```
 
 ## What CI covers
 
 The GitHub Actions workflow runs:
 
 - pre-commit and Ruff on Python 3.12;
-- the Python suite, compile check, console entry point, and wheel build on
-  Python 3.11, 3.12, and 3.13 on both Ubuntu and Windows; and
-- the Claude Channel adapter tests on Node.js 20 on both Ubuntu and Windows.
+- the Python suite, compile check, all console entry points, and wheel build on
+  Python 3.11, 3.12, and 3.13 on both Ubuntu and Windows.
 
-Use `pre-commit run --all-files` plus the Python and Node suites before opening
-a pull request. A passing unit suite is not evidence of live-session delivery;
+Use `pre-commit run --all-files` plus the full Python suite before opening a
+pull request. A passing unit suite is not evidence of live-session delivery;
 claims about Claude or Codex host behavior also require a real interactive-host
 trial and recorded evidence.
 
@@ -100,10 +93,8 @@ tests in the current schema-4 suite.
   environment before running the command.
 - If pre-commit changes a file, review it, stage it again, and rerun
   `pre-commit run --all-files`.
-- If the Node suite cannot resolve the MCP SDK, run
-  `npm ci --prefix adapters/claude-channel` before `npm test`.
-- If a local check differs from CI, confirm the Python and Node versions against
-  the matrix above and reinstall the pinned development extra.
+- If a local check differs from CI, confirm the Python version against the
+  matrix above and reinstall the pinned development extra.
 
 ## Change expectations
 

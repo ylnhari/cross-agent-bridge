@@ -16,42 +16,46 @@ From the Cross-Agent Bridge checkout:
 
 ```powershell
 python -m pip install -e .
-npm ci --prefix adapters/claude-channel
-
-$db = "$PWD\.local\project-chat.sqlite3"
-$init = agent-chat --db $db init --room project | ConvertFrom-Json
-
-$env:AGENT_CHAT_DB = $init.bridge.database
-$env:AGENT_CHAT_BRIDGE = $init.bridge.id
-$env:AGENT_CHAT_ROOM = "project"
+$profile = "$PWD\.local\project.bridge.json"
+agent-chat --db "$PWD\.local\project-chat.sqlite3" `
+  init --room project --write-profile $profile
 ```
 
-Save the resolved database path and bridge ID. Every adapter for this room must
-use those exact values.
+The ignored local profile records the resolved database path, bridge ID, and
+room. Every command below uses that same profile. If an environment variable or
+CLI option disagrees with it, startup fails rather than splitting the chat.
 
 ## 2. Start the Codex participant
 
 In one terminal:
 
 ```powershell
-$env:AGENT_CHAT_ENDPOINT = "codex.app.1"
-
 agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.1 `
   --create-thread `
   --cwd C:\path\to\target-project `
-  --title "Target project executor"
+  --title "Target project executor" `
+  --open-app
 ```
 
-Keep this process running. Its first JSON line contains the Codex task ID. Open
-that task in the Codex app whenever you want to watch its transcript. The
-adapter itself remains outside model turns:
+Keep this process running. Its first JSON line contains the exact task ID and
+`codex://threads/...` deep link; `--open-app` opens that task in the Codex app.
+The adapter itself remains outside model turns:
 
 - idle task + inbound message: `turn/start`;
 - active task + inbound message: `turn/steer`;
 - Codex reply/progress tool call: durable message back to the sender.
 
-The adapter does not approve shell commands, file changes, or user-input
-requests on Codex's behalf. Those remain in the interactive Codex client.
+Natural Codex model-turn completion does not complete a bridge request. The
+root delivery stays pending across as many turns as needed until Codex calls
+`agent_chat_reply`. If Codex observed the root but ended without progress or a
+reply, the adapter automatically starts at most three bounded continuation
+turns. Once progress records that work began, it waits for another bridge event
+instead of polling. If the three continuations remain unacted, the adapter
+sends the peer a nonterminal status and leaves the root open. The adapter does
+not approve shell commands, file changes, or user-input requests on Codex's
+behalf. Those remain in the interactive Codex client.
 
 If console entry points are not on `PATH`, replace `agent-chat-codex` with
 `python -m agent_chat.codex_adapter` and `agent-chat` with
@@ -59,26 +63,33 @@ If console entry points are not on `PATH`, replace `agent-chat-codex` with
 
 ## 3. Start the Claude participant
 
-Create a session-specific `.mcp.json` using the template in
-`adapters/claude-channel/.mcp.json.example`. Set:
-
-- the same database path, bridge ID, and room;
-- a unique endpoint such as `claude.cli.1`;
-- the absolute path to `adapters/claude-channel/index.mjs`.
-
-Then start Claude Code interactively:
+Start Claude Code through the packaged launcher. Give the initial prompt a
+bounded description of the user's existing authority; a Channel event cannot
+grant new authority to a fresh Claude session:
 
 ```powershell
-claude `
-  --mcp-config C:\absolute\path\to\.mcp.json `
-  --strict-mcp-config `
-  --dangerously-load-development-channels server:agent-chat
+agent-chat-claude `
+  --profile $profile `
+  --endpoint claude.cli.1 `
+  --cwd C:\path\to\target-project `
+  --name "Target project orchestrator" `
+  --prompt "Remain available for bridge messages within this project's existing user authority. Observe every exact message_id. Use progress only for nonterminal updates and reply when the requested work is complete."
 ```
 
+The launcher creates a temporary session-specific MCP config, names the Channel
+from the bridge/room/endpoint identity, and exposes only the four bridge tools.
 Claude Code currently labels custom Channels as a research preview. Confirm the
-local-development warning only when the configured adapter path is this trusted
-checkout. Keep the Claude session open. Its Channel subprocess waits and renews
-leases even when the model is idle or busy.
+local-development warning only for this trusted package. Keep the interactive
+Claude session open. Its packaged Python Channel subprocess waits and renews
+leases even when the model is idle or busy; the model itself does not poll.
+After Claude observes a root, silence triggers three Channel reminders at
+30-second intervals. Continued silence produces a durable nonterminal status
+to the original sender while the root remains open.
+
+Reconnect the same native Claude conversation with the same endpoint plus
+`--resume SESSION_ID`. The endpoint lease rejects an accidental second live
+adapter. After a verified crash, wait for the old lease to expire or close the
+old launcher before resuming.
 
 ## 4. Verify the live pair
 
@@ -86,17 +97,17 @@ Use a third diagnostic endpoint so the test does not impersonate either live
 session:
 
 ```powershell
-agent-chat join --endpoint probe.1 --system human-test
-agent-chat members
+agent-chat --profile $profile join --endpoint probe.1 --system human-test
+agent-chat --profile $profile members
 ```
 
 `members` should report `adapter_online: true` for both live endpoints. Send a
 small message to each:
 
 ```powershell
-agent-chat send --from probe.1 --to codex.app.1 --text "Reply with CODEX_OK."
-agent-chat send --from probe.1 --to claude.cli.1 --text "Reply with CLAUDE_OK."
-agent-chat receive --as probe.1 --wait 60
+agent-chat --profile $profile send --from probe.1 --to codex.app.1 --text "Reply with CODEX_OK."
+agent-chat --profile $profile send --from probe.1 --to claude.cli.1 --text "Reply with CLAUDE_OK."
+agent-chat --profile $profile receive --as probe.1 --wait 60
 ```
 
 For a direct agent-to-agent proof, ask either live agent to call
@@ -107,7 +118,8 @@ key for an intentional new conversation.
 
 ## Many sessions and conversations
 
-Run one adapter process per live session and assign each a unique endpoint:
+Run one adapter process per live session and assign each a unique endpoint
+across the whole bridge database:
 
 ```text
 claude.cli.1
@@ -125,6 +137,10 @@ senders addressing one busy session at once.
 The endpoint lease rejects two live adapters that accidentally reuse one ID.
 After an adapter crash, its lease expires. The next instance takes ownership and
 requeues every claimed request that never received a final reply.
+
+The lease is keyed by `(room, endpoint)`, because each adapter subscribes to one
+room. Do not reuse an endpoint name for another native session in another room,
+and do not attach one native session through multiple adapter processes.
 
 ## Long-running work
 
@@ -148,9 +164,12 @@ delivery to `replied`.
   to expire after confirming the old process is gone.
 - **Bridge identity mismatch** — one process points at another SQLite file. Fix
   the path; never bypass the bridge-ID check.
-- **Claude shows no channel** — verify Claude Code is at least 2.1.80, the MCP
-  server name is exactly `agent-chat`, and the development-channel flag names
-  `server:agent-chat`.
+- **Claude shows no channel** — run `agent-chat-claude --check` with the same
+  profile, endpoint, and working directory. Verify Claude Code is at least
+  2.1.80 and start the session through `agent-chat-claude`, not plain `claude`.
+- **Claude receives an event but declines it** — give the interactive session a
+  bounded user prompt authorizing the intended project work. The bridge
+  intentionally does not turn peer text into user authority.
 - **Managed Codex daemon fails on Windows** — omit `--transport`; standalone
   stdio is the Windows default.
 - **A custom `codex exec` wrapper looks silent behind `tail`** — do not place a
@@ -165,4 +184,17 @@ delivery to `replied`.
   bytes, but the model has not yet processed the event. It may still be inside a
   long foreground turn.
 - **A message is `acted` but not `replied`** — work or progress began, but no
-  final answer exists yet. The adapter lease keeps that state recoverable.
+  final answer exists yet. This may be a legitimate wait for another agent or
+  external work; a later bridge event wakes the task. The adapter lease keeps
+  that state recoverable.
+- **A Codex model turn ended but the request is still pending** — this is normal.
+  If the root was observed but never acted on, the adapter schedules a bounded
+  continuation automatically. If it was already acted on, the next bridge event
+  continues the conversation until an explicit final reply is recorded.
+- **The peer receives `Bridge adapter status` or stderr reports
+  `continuation_exhausted`** — an observed root remained unacted through the
+  bounded Codex continuations or Claude reminders. This status is progress, not
+  a final answer; the root remains durable and recoverable. Inspect the
+  interactive task for a permission request, malformed instruction, or
+  model/tool failure, then send a follow-up on the same conversation. Do not
+  start a duplicate endpoint.

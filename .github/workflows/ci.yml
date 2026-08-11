@@ -46,27 +46,10 @@ jobs:
       - name: Compile
         run: python -m compileall -q src
       - name: Console entry point
-        run: agent-chat --help
+        run: |
+          agent-chat --help
+          agent-chat-codex --help
+          agent-chat-claude --help
+          agent-chat-claude-channel --help
       - name: Build wheel
         run: python -m pip wheel . --no-deps --wheel-dir dist
-
-  claude-channel:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: adapters/claude-channel/package-lock.json
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Install channel dependencies
-        run: npm ci --prefix adapters/claude-channel
-      - name: Test Claude Channel adapter
-        run: npm test --prefix adapters/claude-channel

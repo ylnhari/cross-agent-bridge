@@ -31,6 +31,8 @@ dev = [
 [project.scripts]
 agent-chat = "agent_chat.cli:main"
 agent-chat-codex = "agent_chat.codex_adapter:main"
+agent-chat-claude = "agent_chat.claude_launcher:main"
+agent-chat-claude-channel = "agent_chat.claude_channel:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

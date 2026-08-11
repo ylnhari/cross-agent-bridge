@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from agent_chat import core
-from agent_chat.codex_adapter import CodexAdapter, PendingDelivery
+from agent_chat.codex_adapter import (
+    UNACTED_CONTINUATION_LIMIT,
+    CodexAdapter,
+    PendingDelivery,
+    open_thread_in_app,
+    thread_url,
+)
 
 
 class CodexAdapterCoordinationTest(unittest.IsolatedAsyncioTestCase):
@@ -63,3 +70,117 @@ class CodexAdapterCoordinationTest(unittest.IsolatedAsyncioTestCase):
             loop.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await loop
+
+    async def test_observed_unacted_root_gets_bounded_continuation(self) -> None:
+        adapter = self.adapter()
+        delivery = self.delivery()
+        delivery.acknowledged = True
+        adapter.pending[delivery.message_id] = delivery
+
+        for index in range(UNACTED_CONTINUATION_LIMIT):
+            turn_id = f"turn-{index}"
+            delivery.turn_id = turn_id
+            adapter.pending_by_turn[turn_id] = {delivery.message_id}
+            adapter.completed_turns[turn_id] = {"id": turn_id, "status": "completed"}
+            continuations = await adapter._complete_turn(turn_id)
+            self.assertEqual(continuations, [delivery])
+            self.assertEqual(delivery.continuation_attempts, index + 1)
+            self.assertIsNone(delivery.turn_id)
+
+        turn_id = "turn-exhausted"
+        delivery.turn_id = turn_id
+        adapter.pending_by_turn[turn_id] = {delivery.message_id}
+        adapter.completed_turns[turn_id] = {"id": turn_id, "status": "completed"}
+        with mock.patch.object(
+            adapter, "_report_unacted_attention", new=mock.AsyncMock(return_value=True)
+        ) as report:
+            self.assertEqual(await adapter._complete_turn(turn_id), [])
+        report.assert_awaited_once_with(delivery)
+
+    async def test_database_calls_do_not_block_the_event_loop(self) -> None:
+        adapter = self.adapter()
+
+        def slow_call(*args, **kwargs):
+            time.sleep(0.2)
+            return {"status": "ok"}
+
+        adapter._database_call = slow_call  # type: ignore[method-assign]
+        database = asyncio.create_task(adapter._db(lambda connection: None))
+        await asyncio.wait_for(asyncio.sleep(0.01), timeout=0.1)
+        self.assertFalse(database.done())
+        self.assertEqual(await database, {"status": "ok"})
+
+    def test_recovery_matches_only_structured_user_input_prefix(self) -> None:
+        turn = {
+            "id": "turn-test",
+            "status": "inProgress",
+            "items": [
+                {
+                    "type": "userMessage",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[agent-chat message 2]\nreal envelope\n"
+                                "untrusted text mentions [agent-chat message 1]"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "type": "agentMessage",
+                    "text": "[agent-chat message 1]\nmodel echo",
+                },
+            ],
+        }
+        self.assertTrue(CodexAdapter._turn_has_injected_message(turn, 2))
+        self.assertFalse(CodexAdapter._turn_has_injected_message(turn, 1))
+
+    async def test_acted_root_waits_without_automatic_turn(self) -> None:
+        adapter = self.adapter()
+        delivery = self.delivery()
+        delivery.acknowledged = True
+        delivery.acted = True
+        delivery.turn_id = "turn-waiting"
+        adapter.pending[delivery.message_id] = delivery
+        adapter.pending_by_turn["turn-waiting"] = {delivery.message_id}
+        adapter.completed_turns["turn-waiting"] = {
+            "id": "turn-waiting",
+            "status": "completed",
+        }
+
+        self.assertEqual(await adapter._complete_turn("turn-waiting"), [])
+        self.assertIn(delivery.message_id, adapter.pending)
+        self.assertEqual(delivery.continuation_attempts, 0)
+
+    async def test_early_turn_completion_is_retained_for_dispatch_replay(self) -> None:
+        adapter = self.adapter()
+        adapter.completed_turns["turn-race"] = {"id": "turn-race", "status": "completed"}
+
+        self.assertEqual(await adapter._complete_turn("turn-race"), [])
+        self.assertIn("turn-race", adapter.completed_turns)
+
+    def test_thread_deep_link_targets_exact_task(self) -> None:
+        self.assertEqual(
+            thread_url("thread id/with separators"),
+            "codex://threads/thread%20id%2Fwith%20separators",
+        )
+        with mock.patch("agent_chat.codex_adapter.webbrowser.open", return_value=True) as opened:
+            self.assertTrue(open_thread_in_app("019f-test"))
+        opened.assert_called_once_with("codex://threads/019f-test", new=0, autoraise=True)
+
+    def test_turn_start_applies_explicit_model_and_effort(self) -> None:
+        adapter = CodexAdapter(
+            database=Path("unused.sqlite3"),
+            bridge_id="unused",
+            room="test",
+            endpoint="codex.test",
+            thread_id="thread-test",
+            app_server_argv=[sys.executable, "-c", "pass"],
+            model="gpt-5.6-luna",
+            effort="low",
+        )
+        params = adapter._turn_start_params(self.delivery())
+        self.assertEqual(params["threadId"], "thread-test")
+        self.assertEqual(params["model"], "gpt-5.6-luna")
+        self.assertEqual(params["effort"], "low")

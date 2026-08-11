@@ -8,14 +8,22 @@ import sys
 from collections.abc import Callable
 
 thread_id = "thread-visible"
-turn_id = "turn-long"
+turn_id = ""
+turn_sequence = 0
 active = False
 first_message_id: int | None = None
 second_message_id: int | None = None
 transient_message_id: int | None = None
+waiting_root_message_id: int | None = None
+waiting_answer_message_id: int | None = None
+unacted_message_id: int | None = None
+never_act_message_id: int | None = None
+duplicate_reply_message_id: int | None = None
 transient_failures: set[int] = set()
+unacted_seen: set[int] = set()
 next_server_id = 900
 pending_calls: dict[int, Callable[[], None]] = {}
+pending_success: dict[int, bool] = {}
 
 
 def emit(value: dict) -> None:
@@ -24,6 +32,13 @@ def emit(value: dict) -> None:
 
 def response(request: dict, result: dict) -> None:
     emit({"id": request["id"], "result": result})
+
+
+def begin_turn() -> None:
+    global active, turn_id, turn_sequence
+    turn_sequence += 1
+    turn_id = f"turn-{turn_sequence}"
+    active = True
 
 
 def message_id(params: dict) -> int:
@@ -52,11 +67,19 @@ def agent_message(item_id: str, text: str, phase: str) -> None:
     )
 
 
-def call_tool(tool: str, arguments: dict, after: Callable[[], None]) -> None:
+def call_tool(
+    tool: str,
+    arguments: dict,
+    after: Callable[[], None],
+    *,
+    expect_success: bool | None = None,
+) -> None:
     global next_server_id
     request_id = next_server_id
     next_server_id += 1
     pending_calls[request_id] = after
+    if expect_success is not None:
+        pending_success[request_id] = expect_success
     emit(
         {
             "id": request_id,
@@ -131,11 +154,93 @@ def after_transient_observe() -> None:
     )
 
 
+def after_waiting_observe() -> None:
+    assert waiting_root_message_id is not None
+    call_tool(
+        "agent_chat_progress",
+        {
+            "message_id": waiting_root_message_id,
+            "text": "CODEX_WAITING_FOR_CROSS_TURN",
+        },
+        after_waiting_progress,
+    )
+
+
+def after_waiting_progress() -> None:
+    call_tool(
+        "agent_chat_send",
+        {
+            "to": "claude.live",
+            "text": "CODEX_CROSS_TURN_QUESTION",
+            "request_key": "cross-turn-question",
+        },
+        complete_turn,
+    )
+
+
+def after_answer_observe() -> None:
+    assert waiting_root_message_id is not None
+    call_tool(
+        "agent_chat_reply",
+        {
+            "message_id": waiting_root_message_id,
+            "text": "CODEX_CROSS_TURN_DONE",
+        },
+        complete_turn,
+    )
+
+
+def after_unacted_observe() -> None:
+    complete_turn()
+
+
+def after_never_act_observe() -> None:
+    complete_turn()
+
+
+def after_duplicate_observe() -> None:
+    assert duplicate_reply_message_id is not None
+    call_tool(
+        "agent_chat_reply",
+        {"message_id": duplicate_reply_message_id, "text": "CODEX_DUPLICATE_OK"},
+        after_first_duplicate_reply,
+        expect_success=True,
+    )
+
+
+def after_first_duplicate_reply() -> None:
+    assert duplicate_reply_message_id is not None
+    call_tool(
+        "agent_chat_reply",
+        {"message_id": duplicate_reply_message_id, "text": "CODEX_DUPLICATE_OK"},
+        after_identical_duplicate_reply,
+        expect_success=True,
+    )
+
+
+def after_identical_duplicate_reply() -> None:
+    assert duplicate_reply_message_id is not None
+    call_tool(
+        "agent_chat_reply",
+        {"message_id": duplicate_reply_message_id, "text": "CODEX_CONFLICTING_REPLY"},
+        complete_turn,
+        expect_success=False,
+    )
+
+
 for raw_line in sys.stdin:
     request = json.loads(raw_line)
     method = request.get("method")
     if method is None and "id" in request:
-        callback = pending_calls.pop(int(request["id"]), None)
+        response_id = int(request["id"])
+        expected = pending_success.pop(response_id, None)
+        if expected is not None:
+            actual = bool((request.get("result") or {}).get("success"))
+            if actual is not expected:
+                raise RuntimeError(
+                    f"tool response {response_id} success={actual}, expected {expected}"
+                )
+        callback = pending_calls.pop(response_id, None)
         if callback is not None:
             callback()
         continue
@@ -197,9 +302,19 @@ for raw_line in sys.stdin:
                 }
             )
             continue
-        active = True
+        begin_turn()
         if "TRANSIENT_ONCE" in encoded:
             transient_message_id = candidate_id
+        elif "WAIT_ACROSS_TURN" in encoded:
+            waiting_root_message_id = candidate_id
+        elif "CROSS_TURN_ANSWER" in encoded:
+            waiting_answer_message_id = candidate_id
+        elif "OBSERVE_ONLY_ONCE" in encoded:
+            unacted_message_id = candidate_id
+        elif "NEVER_ACT" in encoded:
+            never_act_message_id = candidate_id
+        elif "DUPLICATE_REPLY" in encoded:
+            duplicate_reply_message_id = candidate_id
         else:
             first_message_id = candidate_id
         response(
@@ -221,6 +336,47 @@ for raw_line in sys.stdin:
                 "agent_chat_observe",
                 {"message_id": transient_message_id},
                 after_transient_observe,
+            )
+        elif "WAIT_ACROSS_TURN" in encoded:
+            call_tool(
+                "agent_chat_observe",
+                {"message_id": waiting_root_message_id},
+                after_waiting_observe,
+            )
+        elif "CROSS_TURN_ANSWER" in encoded:
+            call_tool(
+                "agent_chat_observe",
+                {"message_id": waiting_answer_message_id},
+                after_answer_observe,
+            )
+        elif "OBSERVE_ONLY_ONCE" in encoded:
+            if candidate_id in unacted_seen:
+                call_tool(
+                    "agent_chat_reply",
+                    {
+                        "message_id": unacted_message_id,
+                        "text": "CODEX_CONTINUATION_COMPLETE",
+                    },
+                    complete_turn,
+                )
+            else:
+                unacted_seen.add(candidate_id)
+                call_tool(
+                    "agent_chat_observe",
+                    {"message_id": unacted_message_id},
+                    after_unacted_observe,
+                )
+        elif "NEVER_ACT" in encoded:
+            call_tool(
+                "agent_chat_observe",
+                {"message_id": never_act_message_id},
+                after_never_act_observe,
+            )
+        elif "DUPLICATE_REPLY" in encoded:
+            call_tool(
+                "agent_chat_observe",
+                {"message_id": duplicate_reply_message_id},
+                after_duplicate_observe,
             )
         else:
             call_tool(

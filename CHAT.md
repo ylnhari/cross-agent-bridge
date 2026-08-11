@@ -8,39 +8,55 @@ Errors are one JSON object on stderr and normally exit with code 2.
 
 | Environment variable | CLI option | Meaning |
 |---|---|---|
+| `AGENT_CHAT_PROFILE` | `--profile` | Local JSON profile pinning database, bridge ID, and room |
 | `AGENT_CHAT_DB` | `--db` | Exact SQLite database path |
 | `AGENT_CHAT_BRIDGE` | `--expect-bridge` | Expected stable bridge ID |
 | `AGENT_CHAT_ROOM` | `--room` | Current room |
 | `AGENT_CHAT_ENDPOINT` | `--as` / `--from` | Unique live-session endpoint |
 | `AGENT_CHAT_SYSTEM` | `--system` | Agent product or runtime family |
 
-There is no implicit database or room discovery. Pin the bridge ID returned by
-`init` so a wrong path fails before mutation.
+There is no implicit database or room discovery. Prefer one ignored local
+profile. If a database, bridge ID, or room from another source conflicts with
+the profile, the command fails before mutation.
 
 ## Database and membership
 
 ```powershell
 $db = "$PWD\.local\agent-chat.sqlite3"
-$init = agent-chat --db $db init --room ROOM | ConvertFrom-Json
+$profile = "$PWD\.local\room.bridge.json"
+agent-chat --db $db init --room ROOM --write-profile $profile
 
-$env:AGENT_CHAT_DB = $init.bridge.database
-$env:AGENT_CHAT_BRIDGE = $init.bridge.id
-$env:AGENT_CHAT_ROOM = "ROOM"
-
-agent-chat create-room --room OTHER_ROOM
-agent-chat join --endpoint ENDPOINT --system SYSTEM --label "optional"
-agent-chat leave --as ENDPOINT
-agent-chat members
-agent-chat doctor
+agent-chat --profile $profile join --endpoint ENDPOINT --system SYSTEM --label "optional"
+agent-chat --profile $profile leave --as ENDPOINT
+agent-chat --profile $profile members
+agent-chat --profile $profile doctor
 ```
 
-An endpoint identifies one live session. Concurrent sessions never reuse an
-endpoint, even when they belong to the same system. Leaving stops future sends
-to that member but does not delete deliveries already queued for it.
+An endpoint identifies one live session and is unique across the bridge
+database. Concurrent sessions never reuse an endpoint, even in different rooms
+or when they belong to the same system. Leaving stops future sends to that
+member but does not delete deliveries already queued for it.
 
 `members` reports adapter type, host reference, lease expiry, and
 `adapter_online`. That flag proves a host adapter is renewing its lease; it does
 not prove the model is currently generating.
+
+## Live-session launchers
+
+```powershell
+agent-chat-codex --profile $profile --endpoint codex.app.1 `
+  --create-thread --cwd C:\path\to\project --open-app
+
+agent-chat-claude --profile $profile --endpoint claude.cli.1 `
+  --cwd C:\path\to\project --prompt "Wait for authorized bridge messages."
+```
+
+`agent-chat-codex` creates or resumes one app-server task and keeps its adapter
+alive across model-turn boundaries. `agent-chat-claude` starts a genuine
+interactive Claude Code terminal with an isolated packaged Channel. Give every
+concurrent native session a unique endpoint. See
+[docs/LIVE-SESSION-SETUP.md](docs/LIVE-SESSION-SETUP.md) for authority prompts,
+resume commands, and verification.
 
 ## Send
 
@@ -65,6 +81,10 @@ Options:
 
 The same retry key may be reused only with identical text, kind, reply target,
 audience, and recipients.
+
+Each recipient may commit one distinct final reply to a delivered root. An
+identical retry returns the original reply; a conflicting second final reply is
+rejected without inserting another message.
 
 Every root message starts a random `conversation_id`. Progress and replies
 inherit the parent's conversation ID automatically.
@@ -103,9 +123,12 @@ agent-chat adapter-renew --as ENDPOINT --owner PROCESS_TOKEN --ttl 30
 agent-chat adapter-release --as ENDPOINT --owner PROCESS_TOKEN
 ```
 
-Only one unexpired owner may hold an endpoint lease. Release requeues every
-claimed request that never got a final reply. An expired owner cannot renew; it
-must stop rather than continue as a duplicate consumer.
+Only one unexpired owner may hold the `(room, endpoint)` lease. Release requeues
+every claimed request that never got a final reply. An expired owner cannot
+renew; it must stop rather than continue as a duplicate consumer. The lease is
+membership-local, so adapter operators must also preserve the database-wide
+rule that one unique endpoint identifies one native session and must not attach
+that session through multiple adapters.
 
 ## Inspect
 
@@ -127,6 +150,10 @@ boundary.
 `status` distinguishes unread, actively claimed, immediately visible, and
 delivery-state counts. Delivery state is evidence, not a substitute for
 independent verification of repository or external work.
+
+Adapter-generated `Bridge adapter status` messages are nonterminal `progress`
+events. They tell the peer that bounded attention recovery was exhausted; they
+do not close the original root or claim that the target completed its work.
 
 ## Legacy format
 

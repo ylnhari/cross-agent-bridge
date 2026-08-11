@@ -65,7 +65,7 @@ class CodexAdapterE2ETest(unittest.TestCase):
         ]
         self.adapter = self.launch(self.command)
         self.addCleanup(self.stop_adapter)
-        self.wait_for_member("codex.live")
+        self.wait_for_online_adapter("codex.live", host_ref="thread-visible")
 
     def launch(self, command: list[str]) -> subprocess.Popen[str]:
         return subprocess.Popen(
@@ -105,26 +105,7 @@ class CodexAdapterE2ETest(unittest.TestCase):
     def connection(self):
         return core.connect(self.database)
 
-    def wait_for_member(self, endpoint: str) -> None:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if self.adapter.poll() is not None:
-                _, stderr = self.adapter.communicate(timeout=1)
-                self.fail(f"adapter exited early: {stderr}")
-            connection = self.connection()
-            try:
-                endpoints = {
-                    member["endpoint"]
-                    for member in core.members(connection, room="live")["members"]
-                }
-            finally:
-                connection.close()
-            if endpoint in endpoints:
-                return
-            time.sleep(0.05)
-        self.fail(f"adapter did not join as {endpoint}")
-
-    def wait_for_online_adapter(self, endpoint: str) -> None:
+    def wait_for_online_adapter(self, endpoint: str, host_ref: str | None = None) -> None:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.adapter.poll() is not None:
@@ -142,7 +123,11 @@ class CodexAdapterE2ETest(unittest.TestCase):
                 )
             finally:
                 connection.close()
-            if member is not None and member["adapter_online"]:
+            if (
+                member is not None
+                and member["adapter_online"]
+                and (host_ref is None or member["adapter_host_ref"] == host_ref)
+            ):
                 return
             time.sleep(0.05)
         self.fail(f"adapter did not become live for {endpoint}")
@@ -286,6 +271,147 @@ class CodexAdapterE2ETest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_root_remains_pending_across_turns_until_peer_reply_arrives(self) -> None:
+        root_id = self.send_from_claude("WAIT_ACROSS_TURN")
+        initial = [self.receive_for_claude() for _ in range(2)]
+        progress = next(item for item in initial if item["kind"] == "progress")
+        question = next(item for item in initial if item["kind"] == "message")
+        self.assertEqual(progress["reply_to"], root_id)
+        self.assertEqual(progress["text"], "CODEX_WAITING_FOR_CROSS_TURN")
+        self.assertEqual(question["text"], "CODEX_CROSS_TURN_QUESTION")
+
+        answer_id = self.send_from_claude(
+            "CROSS_TURN_ANSWER",
+            reply_to=question["id"],
+        )
+        final = self.receive_for_claude()
+        self.assertEqual(final["reply_to"], root_id)
+        self.assertEqual(final["text"], "CODEX_CROSS_TURN_DONE")
+
+        connection = self.connection()
+        try:
+            root = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=root_id,
+            )["delivery"]
+            answer = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=answer_id,
+            )["delivery"]
+            self.assertEqual(root["state"], "replied")
+            self.assertEqual(answer["state"], "observed")
+            self.assertIsNone(
+                core.wait_for_message(
+                    connection,
+                    room="live",
+                    recipient="claude.live",
+                    wait=0.2,
+                    poll=0.05,
+                    visibility=30,
+                )
+            )
+        finally:
+            connection.close()
+
+    def test_observed_but_unacted_root_is_continued_without_peer_nudge(self) -> None:
+        root_id = self.send_from_claude("OBSERVE_ONLY_ONCE")
+        final = self.receive_for_claude()
+        self.assertEqual(final["reply_to"], root_id)
+        self.assertEqual(final["text"], "CODEX_CONTINUATION_COMPLETE")
+
+        connection = self.connection()
+        try:
+            detail = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=root_id,
+            )["delivery"]
+            self.assertEqual(detail["state"], "replied")
+            self.assertEqual(detail["attempts"], 1)
+            self.assertEqual(
+                [event["state"] for event in detail["events"]],
+                ["queued", "claimed", "injected", "observed", "acted", "replied"],
+            )
+        finally:
+            connection.close()
+
+    def test_exhausted_continuations_notify_the_peer_without_a_fake_reply(self) -> None:
+        root_id = self.send_from_claude("NEVER_ACT")
+        status = self.receive_for_claude()
+        self.assertEqual(status["reply_to"], root_id)
+        self.assertEqual(status["kind"], "progress")
+        self.assertIn("Bridge adapter status", status["text"])
+        self.assertIn("request remains open", status["text"])
+
+        connection = self.connection()
+        try:
+            detail = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=root_id,
+            )["delivery"]
+            self.assertEqual(detail["state"], "acted")
+            self.assertIsNone(detail["replied_at"])
+            self.assertIsNone(
+                core.wait_for_message(
+                    connection,
+                    room="live",
+                    recipient="claude.live",
+                    wait=0.2,
+                    poll=0.05,
+                    visibility=30,
+                )
+            )
+        finally:
+            connection.close()
+
+    def test_reply_tool_retry_is_idempotent_and_conflict_is_rejected(self) -> None:
+        root_id = self.send_from_claude("DUPLICATE_REPLY")
+        reply = self.receive_for_claude()
+        self.assertEqual(reply["reply_to"], root_id)
+        self.assertEqual(reply["text"], "CODEX_DUPLICATE_OK")
+
+        connection = self.connection()
+        try:
+            self.assertIsNone(
+                core.wait_for_message(
+                    connection,
+                    room="live",
+                    recipient="claude.live",
+                    wait=0.2,
+                    poll=0.05,
+                    visibility=30,
+                )
+            )
+            messages = core.history(
+                connection,
+                room="live",
+                viewer="claude.live",
+                limit=50,
+            )["messages"]
+            final_replies = [
+                item for item in messages if item["reply_to"] == root_id and item["kind"] == "reply"
+            ]
+            self.assertEqual([item["text"] for item in final_replies], ["CODEX_DUPLICATE_OK"])
+            self.assertEqual(
+                core.delivery_detail(
+                    connection,
+                    room="live",
+                    recipient="codex.live",
+                    message_id=root_id,
+                )["delivery"]["state"],
+                "replied",
+            )
+        finally:
+            connection.close()
+        self.assertIsNone(self.adapter.poll())
+
     def test_duplicate_adapter_is_rejected_and_hard_kill_can_be_taken_over(self) -> None:
         duplicate = subprocess.run(
             self.attached_command(),
@@ -309,7 +435,7 @@ class CodexAdapterE2ETest(unittest.TestCase):
         self.adapter.communicate(timeout=5)
         time.sleep(5.2)
         self.adapter = self.launch(self.attached_command())
-        self.wait_for_online_adapter("codex.live")
+        self.wait_for_online_adapter("codex.live", host_ref="thread-visible")
         recovered = self.wait_for_attempt(first_id, 2)
         self.assertEqual(recovered["attempts"], 2)
 

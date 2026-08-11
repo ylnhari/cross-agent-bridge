@@ -29,9 +29,19 @@ package registry or promoted as production-ready.
 - Separate `queued`, `claimed`, `injected`, `observed`, `acted`, and `replied`
   evidence.
 - Progress updates that do not falsely complete the original request.
-- One renewable adapter lease per endpoint, preventing duplicate live consumers.
+- Exactly one distinct final reply per delivered root; identical retry-key
+  replays remain idempotent and a conflicting second final reply is rejected.
+- One renewable adapter lease per `(room, endpoint)` membership, preventing
+  duplicate live consumers for that route.
 - Recovery of every claimed but unfinished delivery when an adapter lease is
   lost and a new adapter takes over.
+- Bounded automatic Codex continuation when a model observes a root but ends
+  its turn before reporting progress or replying.
+- Bounded Claude reminders when a model observes a root but does not report
+  progress or reply.
+- A durable, clearly labelled progress status back to the sender when either
+  adapter exhausts its bounded attention recovery. The root remains open and
+  no synthetic final answer is created.
 - A stable bridge ID that fails closed if a session points at the wrong database.
 
 The SQLite core alone is only durable storage. Live attention delivery comes
@@ -40,33 +50,30 @@ turns.
 
 ## Requirements
 
-- Python 3.11 or newer for the core and Codex adapter.
+- Python 3.11 or newer. The core, launchers, and Claude Channel runtime use only
+  the standard library.
 - Codex CLI with app-server support for Codex integration. Version 0.146.0 was
   used for the current Windows validation. See the official
   [Codex app-server documentation](https://developers.openai.com/codex/app-server).
-- Node.js 20 or newer and Claude Code 2.1.80 or newer for the Claude Channel
-  adapter. Version 2.1.226 was used for the current validation. Channels remain
-  an Anthropic research preview; see the official
+- Claude Code 2.1.80 or newer for Claude integration. Version 2.1.227 was used
+  for the current Windows validation. Channels remain an Anthropic research
+  preview; see the official
   [Channels guide](https://code.claude.com/docs/en/channels) and
   [protocol reference](https://code.claude.com/docs/en/channels-reference).
 
-Install the Python package from this checkout:
+Install the complete product from this checkout:
 
 ```powershell
 python -m pip install -e .
 agent-chat --help
+agent-chat-codex --help
+agent-chat-claude --help
 ```
 
 If the Python environment's scripts directory is not on `PATH`, use
 `python -m agent_chat` in place of `agent-chat`, and
-`python -m agent_chat.codex_adapter` in place of `agent-chat-codex`.
-
-Install the pinned Claude adapter dependency only when Claude integration is
-needed:
-
-```powershell
-npm ci --prefix adapters/claude-channel
-```
+`python -m agent_chat.codex_adapter` in place of `agent-chat-codex`, and
+`python -m agent_chat.claude_launcher` in place of `agent-chat-claude`.
 
 ## Create a bridge
 
@@ -74,28 +81,29 @@ Only `init` may create a database. That prevents a misspelled path from silently
 forming a second message fabric.
 
 ```powershell
-$db = "$PWD\.local\agent-chat.sqlite3"
-$init = agent-chat --db $db init --room build | ConvertFrom-Json
-
-$env:AGENT_CHAT_DB = $init.bridge.database
-$env:AGENT_CHAT_BRIDGE = $init.bridge.id
-$env:AGENT_CHAT_ROOM = "build"
+$profile = "$PWD\.local\build.bridge.json"
+agent-chat --db "$PWD\.local\agent-chat.sqlite3" `
+  init --room build --write-profile $profile
 ```
 
-Keep the database in ignored, user-only local storage. Never put a real bridge
-database in Git or a cloud-synced directory.
+The local profile pins the absolute database path, bridge ID, and room. A
+conflicting command-line option or environment variable fails closed, which
+prevents two sessions from silently using different databases. Keep both the
+database and profile in ignored, user-only local storage. Never put either in
+Git or a cloud-synced directory.
 
 ## Connect a live Codex task
 
 Give every live session a unique endpoint ID:
 
 ```powershell
-$env:AGENT_CHAT_ENDPOINT = "codex.app.1"
-
 agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.1 `
   --create-thread `
   --cwd C:\path\to\project `
-  --title "Project executor"
+  --title "Project executor" `
+  --open-app
 ```
 
 The command prints the created Codex task ID and stays running as its adapter.
@@ -114,51 +122,57 @@ app-server daemon is Unix-only. Unix defaults to the managed daemon transport.
 An existing adapter-created task can be reattached after a restart:
 
 ```powershell
-agent-chat-codex --thread-id TASK_ID
+agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.1 `
+  --thread-id TASK_ID `
+  --open-app
 ```
 
-Attaching an arbitrary older task without persisted bridge tools is a limited
-compatibility path. `--compat-output-routing` can forward ordinary model output,
-but it cannot safely infer several simultaneous senders. Use an adapter-created
-task for full multi-conversation routing.
+Attaching an arbitrary older task without persisted bridge tools is limited: the
+adapter can inject a message, but it cannot infer which ordinary model output
+answers which concurrent sender. A delivery becomes terminal only when the task
+calls `agent_chat_reply` for the exact message ID. Use an adapter-created task for
+full multi-conversation routing.
+
+If Codex observes a root and ends a turn without progress or a final reply, the
+adapter starts a bounded continuation turn automatically. Once Codex reports
+progress, the adapter treats it as legitimate long-running or peer-dependent
+work and waits for a new bridge event instead of spending model tokens polling.
+After three unacted continuations, the adapter sends the original peer an
+explicit nonterminal status and leaves the root open for follow-up. It never
+invents a final answer.
 
 ## Connect a live Claude Code session
 
-Create an MCP config for that one Claude session. Paths must be absolute when the
-Claude project is outside this repository:
-
-```json
-{
-  "mcpServers": {
-    "agent-chat": {
-      "command": "node",
-      "args": ["C:\\path\\to\\cross-agent-bridge\\adapters\\claude-channel\\index.mjs"],
-      "env": {
-        "AGENT_CHAT_DB": "C:\\path\\to\\agent-chat.sqlite3",
-        "AGENT_CHAT_BRIDGE": "BRIDGE_ID_FROM_INIT",
-        "AGENT_CHAT_ROOM": "build",
-        "AGENT_CHAT_ENDPOINT": "claude.cli.1",
-        "AGENT_CHAT_SYSTEM": "claude"
-      }
-    }
-  }
-}
-```
-
-Start a genuine interactive Claude Code session:
+Start a genuine interactive Claude Code session. The first prompt grants only
+the authority you actually want that session to exercise; bridge messages do
+not create authority by themselves:
 
 ```powershell
-claude `
-  --mcp-config C:\path\to\.mcp.json `
-  --strict-mcp-config `
-  --dangerously-load-development-channels server:agent-chat
+agent-chat-claude `
+  --profile $profile `
+  --endpoint claude.cli.1 `
+  --cwd C:\path\to\project `
+  --name "Project orchestrator" `
+  --prompt "Remain available for bridge messages within this project's existing user authority. Observe each exact message_id, use progress only for nonterminal updates, and reply when complete."
 ```
 
-The `dangerously-load-development-channels` flag is required by Claude Code's
-current Channel research preview for a local custom channel. Review and accept
-Claude's local-development warning only for this trusted checkout. The channel
-process stays attached to that live session, receives while Claude is busy, and
-renews its bridge lease without spending model tokens.
+The launcher generates an isolated per-session MCP configuration, enables only
+its unique local Channel, and pre-allows only the four bridge messaging tools.
+Claude still controls every other permission. Review and accept Claude's
+local-development Channel warning only for this trusted package. The packaged
+Channel process stays attached to that live session, receives while Claude is
+busy, and renews its bridge lease without spending model tokens. If Claude
+observes a root but remains silent, the Channel injects three bounded reminders
+at 30-second intervals. It then sends the original peer an explicit
+nonterminal status and leaves the root open rather than silently stalling or
+fabricating a final reply.
+
+To reconnect the same Claude conversation after a host restart, repeat the
+command with the same endpoint and add `--resume SESSION_ID`. Use `--continue`
+only when Claude's most recent session in that working directory is definitely
+the intended one.
 
 The validated Claude host is a genuine interactive Claude Code terminal
 session. As of the validation date, Anthropic documents per-session Channel
@@ -168,7 +182,9 @@ connection alone does not enable push delivery. Do not claim Desktop Code-tab
 support until that exact surface passes the same live test.
 
 For another Claude session, use another endpoint ID and another config/process.
-Never reuse one endpoint ID for two concurrent sessions.
+Every native session must use one unique endpoint ID across the whole bridge
+database. Never attach one native session through multiple adapter processes,
+and never reuse one endpoint for concurrent sessions even in different rooms.
 
 ## Talk and inspect
 
@@ -176,13 +192,13 @@ Adapters normally call these operations for the models, but the CLI is useful
 for diagnostics and custom hosts:
 
 ```powershell
-agent-chat join --endpoint observer.1 --system custom
-agent-chat send --from observer.1 --to codex.app.1 --text "Can you verify this?"
-agent-chat receive --as observer.1 --wait 30
-agent-chat history --as observer.1 --limit 50
-agent-chat members
-agent-chat status
-agent-chat doctor
+agent-chat --profile $profile join --endpoint observer.1 --system custom
+agent-chat --profile $profile send --from observer.1 --to codex.app.1 --text "Can you verify this?"
+agent-chat --profile $profile receive --as observer.1 --wait 30
+agent-chat --profile $profile history --as observer.1 --limit 50
+agent-chat --profile $profile members
+agent-chat --profile $profile status
+agent-chat --profile $profile doctor
 ```
 
 Use `--reply-to MESSAGE_ID` for a final answer. Use
@@ -218,13 +234,15 @@ pre-commit run --all-files
 $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
-npm test --prefix adapters/claude-channel
 ```
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the contributor setup, CI
 matrix, individual quality gates, and the intentional legacy exclusions.
 
 The latest real-host evidence is recorded in
-[docs/VALIDATION-2026-08-11.md](docs/VALIDATION-2026-08-11.md). The original
+[docs/VALIDATION-2026-08-11-CROSS-TURN.md](docs/VALIDATION-2026-08-11-CROSS-TURN.md).
+The corresponding pre-release decision record is
+[docs/RELEASE-READINESS-2026-08-11.md](docs/RELEASE-READINESS-2026-08-11.md).
+The original
 two-agent `chat.py` CLI remains frozen only for its pre-release legacy database;
 new integrations use `agent-chat` and schema 4.

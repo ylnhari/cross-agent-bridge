@@ -541,8 +541,12 @@ def _requeue_incomplete(
         SELECT d.message_id, d.attempts
         FROM deliveries AS d
         JOIN messages AS m ON m.id=d.message_id
-        WHERE m.room=? AND d.recipient=? AND d.replied_at IS NULL
+        WHERE m.room=? AND d.recipient=?
           AND d.state IN ('claimed', 'injected', 'observed', 'acted')
+          AND (
+            (m.kind='message' AND d.replied_at IS NULL)
+            OR (m.kind IN ('progress', 'reply') AND d.acked_at IS NULL)
+          )
         ORDER BY d.message_id
         """,
         (room, recipient),
@@ -882,13 +886,19 @@ def send(
                 raise ChatError("reply_to is not visible to this sender")
             parent_delivery = connection.execute(
                 """
-                SELECT 1 FROM deliveries
+                SELECT state FROM deliveries
                 WHERE message_id=? AND recipient=?
                 """,
                 (reply_to, sender),
             ).fetchone()
             if parent_delivery is not None and str(parent["sender"]) not in recipient_list:
                 raise ChatError("a response to an inbound message must include its original sender")
+            if (
+                parent_delivery is not None
+                and kind == "reply"
+                and parent_delivery["state"] == "replied"
+            ):
+                raise ChatError("a final reply was already sent for this inbound message")
             conversation_id = str(parent["conversation_id"])
 
         cursor = connection.execute(

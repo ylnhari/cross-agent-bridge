@@ -75,6 +75,40 @@ class CliE2ETest(unittest.TestCase):
             )
         return result["bridge"]["id"]
 
+    def test_profile_pins_database_bridge_and_room_for_later_commands(self) -> None:
+        profile = Path(self.temp.name) / "bridge.json"
+        initialized = self.run_cli(
+            "init",
+            "--room",
+            "project",
+            "--write-profile",
+            str(profile),
+        )
+        self.assertEqual(initialized["profile"], str(profile.resolve()))
+        command = [
+            sys.executable,
+            "-m",
+            "agent_chat",
+            "--profile",
+            str(profile),
+            "members",
+        ]
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["room"], "project")
+        self.assertEqual(payload["bridge"]["id"], initialized["bridge"]["id"])
+        self.assertEqual(payload["bridge"]["database"], str(self.db.resolve()))
+
     def test_subprocess_group_conversation_and_independent_receipts(self) -> None:
         bridge_id = self.initialize()
         sent = self.run_cli(

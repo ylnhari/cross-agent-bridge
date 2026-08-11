@@ -22,9 +22,10 @@ pre-commit run --all-files
 $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
-npm ci --prefix adapters/claude-channel
-npm test --prefix adapters/claude-channel
 agent-chat --help
+agent-chat-codex --help
+agent-chat-claude --help
+agent-chat-claude-channel --help
 ```
 
 The hook set runs repository hygiene checks, Ruff linting, and Ruff formatting.

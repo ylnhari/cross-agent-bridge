@@ -4,6 +4,7 @@ import concurrent.futures
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -466,6 +467,18 @@ class GroupChatTest(unittest.TestCase):
         self.assertEqual(detail["state"], "replied")
         self.assertTrue(detail["replied_at"])
 
+        with self.assertRaisesRegex(core.ChatError, "final reply was already sent"):
+            core.send(
+                self.connection,
+                room="project",
+                sender="executor.app",
+                recipients=["orchestrator.desktop"],
+                text="different second answer",
+                reply_to=message["id"],
+                dedupe_key="second-final",
+                kind="reply",
+            )
+
         with self.assertRaisesRegex(core.ChatError, "after a final reply"):
             core.send(
                 self.connection,
@@ -510,6 +523,51 @@ class GroupChatTest(unittest.TestCase):
             message_id=message["id"],
         )["delivery"]
         self.assertEqual(detail["state"], "queued")
+
+    def test_concurrent_final_replies_commit_exactly_once(self) -> None:
+        message = core.send(
+            self.connection,
+            room="project",
+            sender="orchestrator.desktop",
+            recipients=["executor.app"],
+            text="one final answer only",
+        )["message"]
+        barrier = threading.Barrier(2)
+
+        def reply(index: int) -> str:
+            connection = core.connect(self.path)
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    core.send(
+                        connection,
+                        room="project",
+                        sender="executor.app",
+                        recipients=["orchestrator.desktop"],
+                        text=f"answer {index}",
+                        reply_to=message["id"],
+                        dedupe_key=f"parallel-final-{index}",
+                        kind="reply",
+                    )
+                except core.ChatError as exc:
+                    return str(exc)
+                return "sent"
+            finally:
+                connection.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(reply, range(2)))
+
+        self.assertEqual(outcomes.count("sent"), 1)
+        self.assertEqual(sum("final reply was already sent" in outcome for outcome in outcomes), 1)
+        conversation = core.history(
+            self.connection,
+            room="project",
+            viewer="orchestrator.desktop",
+            conversation_id=message["conversation_id"],
+            limit=20,
+        )["messages"]
+        self.assertEqual(sum(item["kind"] == "reply" for item in conversation), 1)
 
     def test_replied_state_requires_an_actual_reply_message(self) -> None:
         message = core.send(
@@ -680,6 +738,63 @@ class GroupChatTest(unittest.TestCase):
             first_delivery["delivery"]["receipt"],
         )
 
+    def test_adapter_takeover_does_not_requeue_an_observed_reply(self) -> None:
+        root = core.send(
+            self.connection,
+            room="project",
+            sender="orchestrator.desktop",
+            recipients=["executor.app"],
+            text="question",
+        )["message"]
+        reply = core.send(
+            self.connection,
+            room="project",
+            sender="executor.app",
+            recipients=["orchestrator.desktop"],
+            text="answer",
+            reply_to=root["id"],
+        )["message"]
+        core.acquire_adapter_lease(
+            self.connection,
+            room="project",
+            endpoint="orchestrator.desktop",
+            owner_token="owner-one",
+            adapter="claude.channel",
+            ttl=30,
+        )
+        delivery = self.receive("orchestrator.desktop", visibility=30)
+        self.assertEqual(delivery["message"]["id"], reply["id"])
+        core.acknowledge(
+            self.connection,
+            room="project",
+            recipient="orchestrator.desktop",
+            message_id=reply["id"],
+            receipt=delivery["delivery"]["receipt"],
+        )
+        self.connection.execute(
+            "UPDATE adapter_leases SET lease_until=? WHERE room=? AND endpoint=?",
+            (core.stamp(-1), "project", "orchestrator.desktop"),
+        )
+
+        takeover = core.acquire_adapter_lease(
+            self.connection,
+            room="project",
+            endpoint="orchestrator.desktop",
+            owner_token="owner-two",
+            adapter="claude.channel",
+            ttl=30,
+        )
+
+        self.assertEqual(takeover["recovered"], 0)
+        self.assertIsNone(self.receive("orchestrator.desktop", visibility=30))
+        detail = core.delivery_detail(
+            self.connection,
+            room="project",
+            recipient="orchestrator.desktop",
+            message_id=reply["id"],
+        )["delivery"]
+        self.assertEqual(detail["state"], "observed")
+
     def test_ack_idempotency_requires_the_original_receipt(self) -> None:
         message = core.send(
             self.connection,
@@ -732,7 +847,7 @@ class GroupChatTest(unittest.TestCase):
             visibility=0.05,
         )
         first_connection.close()
-        time.sleep(0.08)
+        time.sleep(0.2)
         restarted = core.connect(self.path)
         self.addCleanup(restarted.close)
         second = core.receive_one(

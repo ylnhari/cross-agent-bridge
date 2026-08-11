@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import core
+from . import profile as bridge_profile
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -86,10 +87,23 @@ def parser() -> argparse.ArgumentParser:
         default=os.environ.get("AGENT_CHAT_BRIDGE"),
         help="expected bridge ID, or AGENT_CHAT_BRIDGE",
     )
+    root.add_argument(
+        "--profile",
+        type=Path,
+        default=Path(os.environ["AGENT_CHAT_PROFILE"])
+        if os.environ.get("AGENT_CHAT_PROFILE")
+        else None,
+        help="local bridge profile, or AGENT_CHAT_PROFILE",
+    )
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="initialize a database and room")
     init.add_argument("--room", default=configured_room)
+    init.add_argument(
+        "--write-profile",
+        type=Path,
+        help="atomically save the resolved database, bridge ID, and room",
+    )
 
     create_room = commands.add_parser("create-room", help="add another room")
     create_room.add_argument("--room", default=configured_room)
@@ -224,6 +238,7 @@ def parser() -> argparse.ArgumentParser:
 
 def run(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    bridge_profile.apply(args)
     if args.db is None:
         raise core.ChatError("database is required: use --db or AGENT_CHAT_DB")
     required_by_command = {
@@ -296,7 +311,16 @@ def run(argv: Sequence[str] | None = None) -> int:
     try:
         core.require_bridge(connection, args.expect_bridge)
         if args.command == "init":
-            emit(connection, path, core.create_room(connection, args.room))
+            result = core.create_room(connection, args.room)
+            if args.write_profile is not None:
+                bridge_profile.write(
+                    args.write_profile,
+                    database=path,
+                    bridge_id=core.bridge_info(connection, path)["id"],
+                    room=args.room,
+                )
+                result["profile"] = str(args.write_profile.resolve())
+            emit(connection, path, result)
         elif args.command == "create-room":
             emit(connection, path, core.create_room(connection, args.room))
         elif args.command == "join":

@@ -9,6 +9,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+MAX_JSONL_BYTES = 32 * 1024 * 1024
+MESSAGE_QUEUE_SIZE = 256
+
 
 class AppServerError(RuntimeError):
     """A transport or JSON-RPC error from Codex app-server."""
@@ -28,8 +31,12 @@ class AppServerClient:
         self.cwd = cwd
         self.request_timeout = request_timeout
         self.process: asyncio.subprocess.Process | None = None
-        self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self.server_requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=MESSAGE_QUEUE_SIZE
+        )
+        self.server_requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=MESSAGE_QUEUE_SIZE
+        )
         self.closed = asyncio.Event()
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
@@ -47,6 +54,7 @@ class AppServerClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=MAX_JSONL_BYTES + 1,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -95,7 +103,7 @@ class AppServerClient:
 
     async def respond(
         self,
-        request_id: int,
+        request_id: str | int,
         *,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
@@ -125,7 +133,17 @@ class AppServerClient:
     async def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         try:
-            while line := await self.process.stdout.readline():
+            while True:
+                try:
+                    line = await self.process.stdout.readline()
+                except ValueError as exc:
+                    raise AppServerError(
+                        f"app-server JSONL frame exceeds {MAX_JSONL_BYTES} bytes"
+                    ) from exc
+                if not line:
+                    break
+                if len(line) > MAX_JSONL_BYTES:
+                    raise AppServerError(f"app-server JSONL frame exceeds {MAX_JSONL_BYTES} bytes")
                 try:
                     message = json.loads(line)
                 except (json.JSONDecodeError, UnicodeError) as exc:
@@ -133,10 +151,16 @@ class AppServerClient:
                 if not isinstance(message, dict):
                     raise AppServerError("app-server emitted a non-object JSON value")
                 if "id" in message and ("result" in message or "error" in message):
-                    future = self._pending.pop(int(message["id"]), None)
+                    response_id = message["id"]
+                    if isinstance(response_id, bool) or not isinstance(response_id, int):
+                        raise AppServerError("app-server response id must be an integer")
+                    future = self._pending.pop(response_id, None)
                     if future is not None and not future.done():
                         future.set_result(message)
                 elif "id" in message and "method" in message:
+                    request_id = message["id"]
+                    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+                        raise AppServerError("app-server request id must be a string or integer")
                     await self.server_requests.put(message)
                 else:
                     await self.notifications.put(message)

@@ -10,8 +10,10 @@ features.
 ## Threat model
 
 Cross-Agent Bridge is designed for mutually trusted processes running under
-one local operating-system account. It opens no network socket and performs no
-network requests.
+one local operating-system account. The bridge transport opens no network
+listener and does not itself make network requests. The Claude Code and Codex
+clients retain their normal provider-service connections outside the bridge's
+transport and threat model.
 
 The SQLite file is not encrypted or authenticated. Any process that can access
 it can read messages, write directly, impersonate endpoints, or acknowledge
