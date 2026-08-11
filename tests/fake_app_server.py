@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 thread_id = "thread-visible"
 turn_id = ""
@@ -24,6 +27,46 @@ unacted_seen: set[int] = set()
 next_server_id = 900
 pending_calls: dict[int, Callable[[], None]] = {}
 pending_success: dict[int, bool] = {}
+
+
+def external_legacy_reply(message_id: int, *, kind: str, text: str) -> None:
+    """Write as a shell-driven legacy task after adapter injection is durable."""
+    from agent_chat import core
+
+    database = os.environ.get("AGENT_CHAT_FAKE_DB")
+    if not database:
+        raise RuntimeError("AGENT_CHAT_FAKE_DB is required for legacy fake replies")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        connection = core.connect(Path(database))
+        try:
+            state = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=message_id,
+            )["delivery"]["state"]
+        finally:
+            connection.close()
+        if state == "injected":
+            break
+        time.sleep(0.01)
+    else:
+        raise RuntimeError("legacy delivery was not durably injected")
+    connection = core.connect(Path(database))
+    try:
+        core.send(
+            connection,
+            room="live",
+            sender="codex.live",
+            recipients=["claude.live"],
+            text=text,
+            reply_to=message_id,
+            dedupe_key=f"fake-legacy-{message_id}-{kind}",
+            kind=kind,
+        )
+    finally:
+        connection.close()
 
 
 def emit(value: dict) -> None:
@@ -321,6 +364,18 @@ for raw_line in sys.stdin:
             request,
             {"turn": {"id": turn_id, "status": "inProgress", "items": []}},
         )
+        if "LEGACY_EXTERNAL_PROGRESS" in encoded:
+            external_legacy_reply(
+                candidate_id,
+                kind="progress",
+                text="CODEX_LEGACY_PROGRESS",
+            )
+        elif "LEGACY_EXTERNAL_FINAL" in encoded:
+            external_legacy_reply(
+                candidate_id,
+                kind="reply",
+                text="CODEX_LEGACY_FINAL",
+            )
         emit(
             {
                 "method": "turn/started",
@@ -331,7 +386,9 @@ for raw_line in sys.stdin:
             }
         )
         agent_message("ui-start", "VISIBLE_ONLY_NOT_RELAYED", "commentary")
-        if "TRANSIENT_ONCE" in encoded:
+        if "LEGACY_EXTERNAL_PROGRESS" in encoded or "LEGACY_EXTERNAL_FINAL" in encoded:
+            complete_turn()
+        elif "TRANSIENT_ONCE" in encoded:
             call_tool(
                 "agent_chat_observe",
                 {"message_id": transient_message_id},

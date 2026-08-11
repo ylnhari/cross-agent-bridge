@@ -8,11 +8,13 @@ from pathlib import Path
 from unittest import mock
 
 from agent_chat import core
+from agent_chat.app_server import AppServerError
 from agent_chat.codex_adapter import (
     UNACTED_CONTINUATION_LIMIT,
     CodexAdapter,
     PendingDelivery,
     open_thread_in_app,
+    shell_command,
     thread_url,
 )
 
@@ -160,6 +162,23 @@ class CodexAdapterCoordinationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await adapter._complete_turn("turn-race"), [])
         self.assertIn("turn-race", adapter.completed_turns)
 
+    async def test_refresh_rejects_parallel_in_progress_turns(self) -> None:
+        adapter = self.adapter()
+        adapter.app.request = mock.AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "thread": {
+                    "turns": [
+                        {"id": "turn-bridge", "status": "inProgress"},
+                        {"id": "turn-ui", "status": "inProgress"},
+                    ]
+                }
+            }
+        )
+
+        with self.assertRaisesRegex(AppServerError, "multiple in-progress turns"):
+            await adapter._refresh_thread()
+        self.assertIsNone(adapter.active_turn_id)
+
     def test_thread_deep_link_targets_exact_task(self) -> None:
         self.assertEqual(
             thread_url("thread id/with separators"),
@@ -184,3 +203,113 @@ class CodexAdapterCoordinationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["threadId"], "thread-test")
         self.assertEqual(params["model"], "gpt-5.6-luna")
         self.assertEqual(params["effort"], "low")
+
+    def test_legacy_input_contains_exact_local_cli_routing(self) -> None:
+        adapter = CodexAdapter(
+            database=Path("unused.sqlite3"),
+            bridge_id="unused",
+            room="test",
+            endpoint="codex.test",
+            thread_id="thread-test",
+            app_server_argv=[sys.executable, "-c", "pass"],
+            legacy_cli_bridge=True,
+            cli_prefix=[sys.executable, "-m", "agent_chat", "--profile", "bridge.json"],
+        )
+        delivery = self.delivery()
+        text = adapter._input_text(delivery)
+        self.assertIn("attached legacy task has no persisted agent_chat_* tools", text)
+        self.assertIn("ack", text)
+        self.assertIn("--receipt", text)
+        self.assertIn("receipt-test", text)
+        self.assertIn("--kind", text)
+        self.assertIn("progress", text)
+        self.assertIn("reply", text)
+        self.assertIn("codex-legacy-1-final", text)
+        self.assertIn("Do not receive or poll", text)
+
+    async def test_legacy_retry_refreshes_the_embedded_receipt(self) -> None:
+        adapter = CodexAdapter(
+            database=Path("unused.sqlite3"),
+            bridge_id="unused",
+            room="test",
+            endpoint="codex.test",
+            thread_id="thread-test",
+            app_server_argv=[sys.executable, "-c", "pass"],
+            legacy_cli_bridge=True,
+            cli_prefix=[sys.executable, "-m", "agent_chat", "--profile", "bridge.json"],
+        )
+        delivery = self.delivery()
+        delivery.attempt = 2
+        delivery.receipt = "receipt-current"
+        adapter._refresh_thread = mock.AsyncMock()  # type: ignore[method-assign]
+
+        self.assertIsNone(await adapter._recover_prior_dispatch(delivery))
+        adapter._refresh_thread.assert_not_awaited()
+        text = adapter._input_text(delivery)
+        self.assertIn("Delivery recovery attempt 2", text)
+        self.assertIn("receipt-current", text)
+        self.assertIn("do not repeat completed side effects", text)
+
+    async def test_legacy_external_progress_prevents_a_spurious_continuation(self) -> None:
+        adapter = self.adapter()
+        adapter.legacy_cli_bridge = True
+        delivery = self.delivery()
+        delivery.turn_id = "turn-legacy-progress"
+        adapter.pending[delivery.message_id] = delivery
+        adapter.pending_by_turn[delivery.turn_id] = {delivery.message_id}
+        adapter.completed_turns[delivery.turn_id] = {
+            "id": delivery.turn_id,
+            "status": "completed",
+        }
+        adapter._db = mock.AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "delivery": {
+                    "state": "acted",
+                    "acked_at": "2026-08-11T00:00:00Z",
+                    "replied_at": None,
+                }
+            }
+        )
+
+        self.assertEqual(await adapter._complete_turn(delivery.turn_id), [])
+        self.assertTrue(delivery.acknowledged)
+        self.assertTrue(delivery.acted)
+        self.assertFalse(delivery.replied)
+        self.assertIn(delivery.message_id, adapter.pending)
+        self.assertEqual(delivery.continuation_attempts, 0)
+
+    async def test_legacy_external_final_reply_archives_the_delivery(self) -> None:
+        adapter = self.adapter()
+        adapter.legacy_cli_bridge = True
+        delivery = self.delivery()
+        delivery.turn_id = "turn-legacy-final"
+        adapter.pending[delivery.message_id] = delivery
+        adapter.pending_by_turn[delivery.turn_id] = {delivery.message_id}
+        adapter.completed_turns[delivery.turn_id] = {
+            "id": delivery.turn_id,
+            "status": "completed",
+        }
+        adapter._db = mock.AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "delivery": {
+                    "state": "replied",
+                    "acked_at": "2026-08-11T00:00:00Z",
+                    "replied_at": "2026-08-11T00:00:00Z",
+                }
+            }
+        )
+
+        self.assertEqual(await adapter._complete_turn(delivery.turn_id), [])
+        self.assertNotIn(delivery.message_id, adapter.pending)
+        self.assertIn(delivery.message_id, adapter.completed)
+        self.assertTrue(delivery.replied)
+
+    def test_shell_command_quotes_every_windows_argument(self) -> None:
+        command = shell_command(["C:\\Program Files\\Python\\python.exe", "a'b", "plain"])
+        if sys.platform == "win32":
+            self.assertEqual(
+                command,
+                "& 'C:\\Program Files\\Python\\python.exe' 'a''b' 'plain'",
+            )
+        else:
+            self.assertEqual(command, "'C:\\Program Files\\Python\\python.exe' 'a'\"'\"'b' plain")

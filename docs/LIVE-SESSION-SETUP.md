@@ -47,6 +47,16 @@ The adapter itself remains outside model turns:
 - active task + inbound message: `turn/steer`;
 - Codex reply/progress tool call: durable message back to the sender.
 
+`--open-app` opens the exact persisted task; it does not make the Windows app a
+second synchronized controller for the adapter's live turn. While an
+adapter-started turn is active, its messages may not appear immediately in the
+app timeline. Typing into that task can start a second concurrent turn in the
+same rollout, making the app foreground the manual turn while the bridge turn
+continues in the background. During active bridge work, send new guidance
+through the orchestrator/bridge. Use the Codex app for task visibility,
+completed history, and native permission handling, or wait until the active
+turn finishes before sending directly in the app.
+
 Natural Codex model-turn completion does not complete a bridge request. The
 root delivery stays pending across as many turns as needed until Codex calls
 `agent_chat_reply`. If Codex observed the root but ended without progress or a
@@ -60,6 +70,17 @@ behalf. Those remain in the interactive Codex client.
 If console entry points are not on `PATH`, replace `agent-chat-codex` with
 `python -m agent_chat.codex_adapter` and `agent-chat` with
 `python -m agent_chat` throughout this guide.
+
+To connect an older Codex task that was not originally created by this adapter,
+use `--thread-id TASK_ID --legacy-cli-bridge` instead of `--create-thread` and
+`--cwd`. Codex app-server cannot add dynamic tools while resuming an existing
+task. Compatibility mode therefore injects exact local CLI commands for that
+message's observation, progress, and final reply. The adapter reconciles those
+out-of-process writes with its in-memory delivery state before claim renewal or
+continuation. The task still receives messages through `turn/start` and
+`turn/steer`; it must not poll the bridge itself. Use this mode only when the
+task has an ordinary local shell tool. On Windows, the generated commands use
+PowerShell syntax; attach the task only when its shell tool runs PowerShell.
 
 ## 3. Start the Claude participant
 
@@ -172,6 +193,20 @@ delivery to `replied`.
   intentionally does not turn peer text into user authority.
 - **Managed Codex daemon fails on Windows** — omit `--transport`; standalone
   stdio is the Windows default.
+- **An attached older Codex task has no `agent_chat_*` tools** — stop only that
+  endpoint's adapter, confirm its lease is gone, then restart it with the same
+  task, endpoint, and profile plus `--legacy-cli-bridge`. Never run the old and
+  new adapter concurrently.
+- **A long existing Codex task fails during attach with a JSONL frame limit** —
+  update the package before retrying. The adapter accepts app-server history
+  frames up to 128 MiB and still fails closed above that ceiling.
+- **Codex controls tools but its bridge conversation is missing from the app
+  timeline** — confirm the task ID printed by the adapter. On Windows, a
+  standalone app-server turn can execute in the exact persisted task without
+  live-rendering in the app. Reopening the deep link may refresh completed
+  history. Do not type into the task while the bridge turn is active: that can
+  create a second in-progress turn rather than steering the adapter-owned turn.
+  Send the intervention through the peer/bridge or wait for idle.
 - **A custom `codex exec` wrapper looks silent behind `tail`** — do not place a
   live run behind `2>&1 | tail`. `tail` withholds its window until the upstream
   process closes, so a completed turn followed by a stuck shutdown looks like

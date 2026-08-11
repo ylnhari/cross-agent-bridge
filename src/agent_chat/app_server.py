@@ -9,7 +9,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-MAX_JSONL_BYTES = 32 * 1024 * 1024
+# Legacy Codex app threads can return their complete persisted history as one
+# JSONL response during ``thread/resume`` even when an initial page is
+# requested.  Keep a hard transport ceiling, but make it large enough to
+# reattach real long-running interactive threads (the Windows app commonly
+# accumulates more than 32 MiB before compaction).
+MAX_JSONL_BYTES = 128 * 1024 * 1024
 MESSAGE_QUEUE_SIZE = 256
 
 

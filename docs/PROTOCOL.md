@@ -155,6 +155,20 @@ attention delivery:
   adapter sends the original peer a clearly labelled nonterminal `progress`
   status and leaves the root open.
 
+An older Codex task cannot acquire dynamic tools retroactively. Explicit
+`--legacy-cli-bridge` mode injects locally generated CLI commands containing
+that delivery's current receipt and exact reply routing. The adapter reconciles
+the resulting out-of-process observation, progress, and final-reply state
+before claim renewal or continuation. On takeover, it injects a refreshed
+envelope rather than reusing a stale receipt.
+
+The Codex app is not part of the delivery protocol. In particular, a Windows
+desktop client and a standalone app-server process can address the same
+persisted task without sharing one live foreground turn. The app may lag an
+adapter-started turn, and a manual app message can create a second concurrent
+turn. Operators send interventions through the bridge or wait for idle; task
+visibility alone is not proof of synchronized UI control.
+
 The adapter processes wait and renew leases without model tokens. A model does
 not run a polling loop between turns. SQLite operations run outside each
 adapter's asynchronous host-transport loop so lock waits do not suppress lease

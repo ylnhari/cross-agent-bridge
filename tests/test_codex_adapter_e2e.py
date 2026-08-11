@@ -33,6 +33,7 @@ class CodexAdapterE2ETest(unittest.TestCase):
         self.env = os.environ.copy()
         existing = self.env.get("PYTHONPATH")
         self.env["PYTHONPATH"] = str(ROOT / "src") + (os.pathsep + existing if existing else "")
+        self.env["AGENT_CHAT_FAKE_DB"] = str(self.database)
         self.command = [
             sys.executable,
             "-m",
@@ -132,6 +133,23 @@ class CodexAdapterE2ETest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"adapter did not become live for {endpoint}")
 
+    def wait_for_offline_adapter(self, endpoint: str) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            connection = self.connection()
+            try:
+                member = next(
+                    item
+                    for item in core.members(connection, room="live")["members"]
+                    if item["endpoint"] == endpoint
+                )
+            finally:
+                connection.close()
+            if not member["adapter_online"]:
+                return
+            time.sleep(0.05)
+        self.fail(f"adapter lease did not expire for {endpoint}")
+
     def wait_for_attempt(self, message_id: int, attempt: int) -> dict:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -169,7 +187,7 @@ class CodexAdapterE2ETest(unittest.TestCase):
         finally:
             connection.close()
 
-    def receive_for_claude(self, wait: float = 10) -> dict:
+    def receive_for_claude(self, wait: float = 30) -> dict:
         connection = self.connection()
         try:
             delivery = core.wait_for_message(
@@ -180,7 +198,18 @@ class CodexAdapterE2ETest(unittest.TestCase):
                 poll=0.05,
                 visibility=30,
             )
-            self.assertIsNotNone(delivery)
+            if delivery is None:
+                diagnostic = {
+                    "adapter_returncode": self.adapter.poll(),
+                    "status": core.status(connection, room="live"),
+                    "history": core.history(
+                        connection,
+                        room="live",
+                        viewer="claude.live",
+                        limit=50,
+                    )["messages"],
+                }
+                self.fail(f"timed out waiting for Claude delivery: {diagnostic!r}")
             core.acknowledge(
                 connection,
                 room="live",
@@ -444,6 +473,77 @@ class CodexAdapterE2ETest(unittest.TestCase):
         by_parent = {item["reply_to"]: item["text"] for item in replies}
         self.assertEqual(by_parent[second_id], "CODEX_RECEIVED_STEER")
         self.assertEqual(by_parent[first_id], "CODEX_LONG_TASK_COMPLETE")
+        self.assertIsNone(self.adapter.poll())
+
+    def test_legacy_cli_progress_is_reconciled_without_a_duplicate_wake(self) -> None:
+        self.stop_adapter()
+        self.wait_for_offline_adapter("codex.live")
+        self.adapter = self.launch([*self.attached_command(), "--legacy-cli-bridge"])
+        self.wait_for_online_adapter("codex.live", host_ref="thread-visible")
+
+        root_id = self.send_from_claude("LEGACY_EXTERNAL_PROGRESS")
+        progress = self.receive_for_claude()
+        self.assertEqual(progress["reply_to"], root_id)
+        self.assertEqual(progress["kind"], "progress")
+        self.assertEqual(progress["text"], "CODEX_LEGACY_PROGRESS")
+        time.sleep(0.3)
+
+        connection = self.connection()
+        try:
+            detail = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=root_id,
+            )["delivery"]
+            self.assertEqual(detail["state"], "acted")
+            self.assertEqual(detail["attempts"], 1)
+            self.assertEqual(
+                [event["state"] for event in detail["events"]],
+                ["queued", "claimed", "injected", "acted"],
+            )
+            self.assertIsNone(
+                core.wait_for_message(
+                    connection,
+                    room="live",
+                    recipient="claude.live",
+                    wait=0.2,
+                    poll=0.05,
+                    visibility=30,
+                )
+            )
+        finally:
+            connection.close()
+        self.assertIsNone(self.adapter.poll())
+
+    def test_legacy_cli_final_reply_is_reconciled_at_turn_completion(self) -> None:
+        self.stop_adapter()
+        self.wait_for_offline_adapter("codex.live")
+        self.adapter = self.launch([*self.attached_command(), "--legacy-cli-bridge"])
+        self.wait_for_online_adapter("codex.live", host_ref="thread-visible")
+
+        root_id = self.send_from_claude("LEGACY_EXTERNAL_FINAL")
+        reply = self.receive_for_claude()
+        self.assertEqual(reply["reply_to"], root_id)
+        self.assertEqual(reply["kind"], "reply")
+        self.assertEqual(reply["text"], "CODEX_LEGACY_FINAL")
+
+        connection = self.connection()
+        try:
+            detail = core.delivery_detail(
+                connection,
+                room="live",
+                recipient="codex.live",
+                message_id=root_id,
+            )["delivery"]
+            self.assertEqual(detail["state"], "replied")
+            self.assertEqual(detail["attempts"], 1)
+            self.assertEqual(
+                [event["state"] for event in detail["events"]],
+                ["queued", "claimed", "injected", "replied"],
+            )
+        finally:
+            connection.close()
         self.assertIsNone(self.adapter.poll())
 
 

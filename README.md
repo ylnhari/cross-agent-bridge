@@ -116,6 +116,16 @@ For each intended new conversation, `agent_chat_send` uses a caller-chosen
 stable `request_key`; retries reuse it, while intentional new sends use a new
 key.
 
+On Windows, the app and a standalone app-server adapter do not share one live
+foreground controller. The task ID and persisted rollout are the same, but the
+Codex app may not render an adapter-started turn while that turn is still
+running. Do not type a second instruction into the Codex app during an active
+bridge turn: the app can start another in-progress turn in the same task and
+foreground that turn while the bridge turn continues in the background. Send
+interventions through the bridge (normally through the orchestrator), or wait
+for the adapter-owned turn to finish. The app remains useful for opening the
+exact task, inspecting completed history, and handling native permission UI.
+
 On Windows, the adapter uses a standalone stdio app-server because the managed
 app-server daemon is Unix-only. Unix defaults to the managed daemon transport.
 
@@ -129,11 +139,26 @@ agent-chat-codex `
   --open-app
 ```
 
-Attaching an arbitrary older task without persisted bridge tools is limited: the
-adapter can inject a message, but it cannot infer which ordinary model output
-answers which concurrent sender. A delivery becomes terminal only when the task
-calls `agent_chat_reply` for the exact message ID. Use an adapter-created task for
-full multi-conversation routing.
+An arbitrary older task cannot acquire dynamic tools retroactively. Attach it
+with explicit CLI compatibility instead:
+
+```powershell
+agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.legacy.1 `
+  --thread-id EXISTING_TASK_ID `
+  --legacy-cli-bridge `
+  --open-app
+```
+
+Each injected envelope then contains exact, locally generated `agent-chat`
+commands for observation, progress, and the one final reply. The task uses its
+ordinary shell tool; it never polls the queue. The adapter reconciles the
+external CLI writes before renewing a claim or scheduling a continuation, so a
+long turn cannot turn valid progress into a duplicate wake. This compatibility
+mode requires that the attached task can run local shell commands. Prefer an
+adapter-created task when starting fresh because its native bridge tools are
+more concise and harder for a model to mistype.
 
 If Codex observes a root and ends a turn without progress or a final reply, the
 adapter starts a bounded continuation turn automatically. Once Codex reports
