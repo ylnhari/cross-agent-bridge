@@ -5,7 +5,7 @@
   "description": "Claude Code Channel adapter for Cross-Agent Bridge",
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/bridge-client.test.mjs test/channel-process.test.mjs test/tool-contract.test.mjs"
   },
   "engines": {
     "node": ">=20"
