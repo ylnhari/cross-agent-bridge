@@ -836,6 +836,25 @@ class GroupChatTest(unittest.TestCase):
         check.close()
         self.assertEqual(tables, {"unrelated"})
 
+    def test_connect_retries_a_transient_wal_configuration_lock(self) -> None:
+        path = Path(self.temp.name) / "wal-race.sqlite3"
+        original = core._enable_wal_once
+        attempts = 0
+
+        def transient_lock(connection: sqlite3.Connection) -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return original(connection)
+
+        with mock.patch.object(core, "_enable_wal_once", side_effect=transient_lock):
+            connection = core.connect(path, create=True)
+        self.addCleanup(connection.close)
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
     def test_concurrent_senders_persist_every_message_once(self) -> None:
         def worker(index: int) -> int:
             connection = core.connect(self.path)

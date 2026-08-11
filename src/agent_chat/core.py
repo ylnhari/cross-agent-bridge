@@ -20,6 +20,8 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DELIVERY_STATES = ("queued", "claimed", "injected", "observed", "acted", "replied")
 DELIVERY_PROGRESS = {state: index for index, state in enumerate(DELIVERY_STATES)}
 MESSAGE_KINDS = ("message", "progress", "reply")
+SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
+SQLITE_BUSY_RETRY_SECONDS = 0.01
 
 
 class ChatError(RuntimeError):
@@ -197,6 +199,37 @@ def _validate_schema(connection: sqlite3.Connection, path: Path) -> None:
         raise ChatError(f"Agent Chat database has an incomplete schema: {path}")
 
 
+def _is_sqlite_busy(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def _enable_wal_once(connection: sqlite3.Connection) -> bool:
+    journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    if journal_mode.lower() == "wal":
+        return True
+    enabled_mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
+    return enabled_mode.lower() == "wal"
+
+
+def _ensure_wal(connection: sqlite3.Connection) -> None:
+    """Enable persistent WAL mode despite a concurrent initializer doing the same."""
+    deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_SECONDS
+    while True:
+        try:
+            if _enable_wal_once(connection):
+                return
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy(exc):
+                raise
+        if time.monotonic() >= deadline:
+            raise ChatError("could not enable SQLite WAL mode before the database became available")
+        time.sleep(SQLITE_BUSY_RETRY_SECONDS)
+
+
 def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
     """Open one initialized bridge, creating it only when explicitly requested."""
     path = path.resolve()
@@ -212,7 +245,7 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
     try:
         connection = sqlite3.connect(
             f"{path.as_uri()}?mode=rw",
-            timeout=10.0,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             isolation_level=None,
             uri=True,
         )
@@ -224,29 +257,22 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
             ) from exc
         raise
     connection.row_factory = sqlite3.Row
-    tables = _tables(connection)
-    if not tables:
-        if not create:
-            connection.close()
-            raise ChatError(f"not an initialized Agent Chat database: {path}")
-        try:
-            _create_schema(connection)
-        except Exception:
-            connection.close()
-            raise
     try:
+        connection.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
+        tables = _tables(connection)
+        if not tables:
+            if not create:
+                raise ChatError(f"not an initialized Agent Chat database: {path}")
+            _create_schema(connection)
         # Always re-read after creation. Another initializer may have won the
         # serialized schema transaction after this connection first saw no tables.
         _validate_schema(connection, path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        _ensure_wal(connection)
+        connection.execute("PRAGMA synchronous = FULL")
     except Exception:
         connection.close()
         raise
-    connection.execute("PRAGMA busy_timeout = 10000")
-    connection.execute("PRAGMA foreign_keys = ON")
-    journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
-    if journal_mode.lower() != "wal":
-        connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 
