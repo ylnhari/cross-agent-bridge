@@ -1,82 +1,136 @@
-# Agent Chat v2
+# Agent Chat command reference
 
-V2 is deliberately a small talking app, not a workflow engine. Messages are
-free-form text. Either agent can ask questions, answer, challenge assumptions,
-share evidence, propose a plan, or request clarification.
+Every command prints one compact JSON object. Successful objects include the
+resolved database path, stable bridge ID, and schema version under `bridge`.
+Errors are one JSON object on stderr and normally exit with code 2.
 
-Only the envelope is structured:
+## Shared configuration
 
-- room
-- sender and recipient
-- text
-- optional reply-to message ID
-- optional retry key
-- acknowledgement timestamp
+| Environment variable | CLI option | Meaning |
+|---|---|---|
+| `AGENT_CHAT_DB` | `--db` | Exact SQLite database path |
+| `AGENT_CHAT_BRIDGE` | `--expect-bridge` | Expected stable bridge ID |
+| `AGENT_CHAT_ROOM` | `--room` | Current room |
+| `AGENT_CHAT_ENDPOINT` | `--as` / `--from` | Unique live-session endpoint |
+| `AGENT_CHAT_SYSTEM` | `--system` | Agent product or runtime family |
 
-## Commands
+There is no implicit database or room discovery. Pin the bridge ID returned by
+`init` so a wrong path fails before mutation.
 
-```powershell
-python chat.py --db .local/mycard-chat.sqlite3 init --room mycard-benefits
-
-python chat.py --db .local/mycard-chat.sqlite3 send `
-  --room mycard-benefits --from claude --to codex `
-  --text "Please check whether these two records describe one benefit or two."
-
-python chat.py --db .local/mycard-chat.sqlite3 receive `
-  --room mycard-benefits --as codex --wait 300
-
-python chat.py --db .local/mycard-chat.sqlite3 sync `
-  --room mycard-benefits --as codex --with claude --wait 30
-
-python chat.py --db .local/mycard-chat.sqlite3 ack `
-  --room mycard-benefits --as codex --id 1
-
-python chat.py --db .local/mycard-chat.sqlite3 history `
-  --room mycard-benefits --limit 20
-```
-
-For multiline text in PowerShell, use a variable:
+## Database and membership
 
 ```powershell
-$message = @'
-I found two plausible interpretations.
-Which one matches your intended product behavior, and why?
-'@
-python chat.py --db .local/mycard-chat.sqlite3 send --room mycard-benefits --from codex --to claude --text $message
+$db = "$PWD\.local\agent-chat.sqlite3"
+$init = agent-chat --db $db init --room ROOM | ConvertFrom-Json
+
+$env:AGENT_CHAT_DB = $init.bridge.database
+$env:AGENT_CHAT_BRIDGE = $init.bridge.id
+$env:AGENT_CHAT_ROOM = "ROOM"
+
+agent-chat create-room --room OTHER_ROOM
+agent-chat join --endpoint ENDPOINT --system SYSTEM --label "optional"
+agent-chat leave --as ENDPOINT
+agent-chat members
+agent-chat doctor
 ```
 
-`receive` returns the oldest unacknowledged message. It leaves the message
-unacknowledged, so a crashed session receives it again. Acknowledge after the
-agent has understood it, then answer with an optional `--reply-to`.
+An endpoint identifies one live session. Concurrent sessions never reuse an
+endpoint, even when they belong to the same system. Leaving stops future sends
+to that member but does not delete deliveries already queued for it.
 
-Use `sync` for active agent-to-agent operation. It waits once for an unread
-message. If none arrives, it sends one natural-language `CHECK-IN` asking the
-peer whether it is waiting, wants work to continue, or considers the run done.
-It never sends another check-in while an earlier outgoing message is unread. A
-later empty sync instead returns `peer_pending`, so the caller stops duplicate
-polling and surfaces the pending message. This is not proof that the peer or
-transport is dead: a desktop agent may simply be inside a long foreground turn.
-If the peer acknowledged the check-in but did not answer, sync returns
-`peer_reply_pending`.
+`members` reports adapter type, host reference, lease expiry, and
+`adapter_online`. That flag proves a host adapter is renewing its lease; it does
+not prove the model is currently generating.
 
-On either pending status, do not enqueue another check-in. If the host already
-has an authorized native way to wake the same session, use it once with the
-pending message ID; otherwise report the condition visibly and let the user or
-host wake the peer. Never create or reconnect a session merely to obtain a wake
-path.
+## Send
 
-Every command requires an explicit `--db` and `--room`. New database files are
-created only by `init`; a typo in a later command fails instead of creating a
-second queue. Every JSON response includes the resolved database path and a
-stable bridge ID. Each agent checks those values before starting work.
+```powershell
+agent-chat send --from ENDPOINT --to PEER --text "question"
+agent-chat send --from ENDPOINT --to PEER_A --to PEER_B --stdin
+agent-chat send --from ENDPOINT --broadcast --file message.txt
 
-Waiting is performed by SQLite/Python, not by model generation. If a desktop
-turn closes, the message remains stored but the app still needs a host, goal,
-automation, or user wake-up.
+agent-chat send --from ENDPOINT --to PEER `
+  --reply-to MESSAGE_ID --kind progress --text "Still working"
 
-## Boundaries outside the format
+agent-chat send --from ENDPOINT --to PEER `
+  --reply-to MESSAGE_ID --kind reply --text "Final answer"
+```
 
-Conversation is flexible; authority is not. The user and target repository
-instructions still decide scope. Claude remains orchestrator/reviewer and
-Codex remains the sole repository writer for the current MyCard run. Neither
-agent sends secrets, private data, raw transcripts, or unnecessarily large logs.
+Options:
+
+- `--reply-to MESSAGE_ID` links to a message visible to the sender.
+- `--kind message|progress|reply` records conversational intent. Root sends are
+  `message`; linked sends default to final `reply`.
+- `--key CLIENT_MESSAGE_ID` makes a retry idempotent for that sender and room.
+
+The same retry key may be reused only with identical text, kind, reply target,
+audience, and recipients.
+
+Every root message starts a random `conversation_id`. Progress and replies
+inherit the parent's conversation ID automatically.
+
+## Receive and delivery evidence
+
+```powershell
+agent-chat receive --as ENDPOINT --wait 300 --visibility 900
+agent-chat mark --as ENDPOINT --id MESSAGE_ID --receipt RECEIPT `
+  --state injected --adapter host.adapter --host-ref SESSION_REFERENCE
+agent-chat ack --as ENDPOINT --id MESSAGE_ID --receipt RECEIPT
+agent-chat mark --as ENDPOINT --id MESSAGE_ID --receipt RECEIPT --state acted
+agent-chat release --as ENDPOINT --id MESSAGE_ID --receipt RECEIPT
+agent-chat renew --as ENDPOINT --id MESSAGE_ID --receipt RECEIPT --visibility 900
+agent-chat delivery --as ENDPOINT --id MESSAGE_ID
+```
+
+`receive` claims the oldest visible delivery atomically and returns a random
+receipt, attempt number, and visibility expiry. A stale receipt cannot mutate a
+newer attempt. Exit code 3 with `status=empty` means a bounded wait ended without
+a message; it is not a transport failure.
+
+Host adapters mark `injected` only after their host accepts the event. The model
+calls `ack` to record `observed`, then marks or sends progress when acting. A
+final linked reply records `replied` automatically.
+
+## Adapter ownership
+
+These commands are primarily for host-adapter implementations:
+
+```powershell
+agent-chat adapter-acquire --as ENDPOINT --owner PROCESS_TOKEN `
+  --adapter host.adapter --host-ref SESSION_REFERENCE --ttl 30
+
+agent-chat adapter-renew --as ENDPOINT --owner PROCESS_TOKEN --ttl 30
+agent-chat adapter-release --as ENDPOINT --owner PROCESS_TOKEN
+```
+
+Only one unexpired owner may hold an endpoint lease. Release requeues every
+claimed request that never got a final reply. An expired owner cannot renew; it
+must stop rather than continue as a duplicate consumer.
+
+## Inspect
+
+```powershell
+agent-chat status --room ROOM
+agent-chat history --room ROOM --as ENDPOINT --limit 50
+agent-chat history --room ROOM --as ENDPOINT `
+  --conversation CONVERSATION_ID --limit 50
+agent-chat members --room ROOM
+agent-chat delivery --room ROOM --as ENDPOINT --id MESSAGE_ID
+agent-chat doctor
+```
+
+Endpoint-scoped history includes only messages sent by or delivered to that
+endpoint. Admin history without `--as` returns the room transcript to any
+process that can open the database, which is why filesystem access is the trust
+boundary.
+
+`status` distinguishes unread, actively claimed, immediately visible, and
+delivery-state counts. Delivery state is evidence, not a substitute for
+independent verification of repository or external work.
+
+## Legacy format
+
+`chat.py` is the frozen two-agent compatibility CLI for the original local
+prototype. The packaged `agent-chat` CLI refuses that database and unsupported
+pre-release schemas instead of silently migrating live state. New integrations
+use schema 4.

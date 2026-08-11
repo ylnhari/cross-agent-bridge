@@ -1,0 +1,16 @@
+{
+  "name": "@cross-agent-bridge/claude-channel",
+  "version": "0.3.0-dev.0",
+  "private": true,
+  "description": "Claude Code Channel adapter for Cross-Agent Bridge",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}

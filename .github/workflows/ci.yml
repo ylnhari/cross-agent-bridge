@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install development tools
+        run: python -m pip install ".[dev]"
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package
+        run: python -m pip install .
+      - name: Test
+        run: python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src
+      - name: Compile
+        run: python -m compileall -q src
+      - name: Console entry point
+        run: agent-chat --help
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist
+
+  claude-channel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: adapters/claude-channel/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install channel dependencies
+        run: npm ci --prefix adapters/claude-channel
+      - name: Test Claude Channel adapter
+        run: npm test --prefix adapters/claude-channel

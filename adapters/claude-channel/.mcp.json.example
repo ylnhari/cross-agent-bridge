@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "agent-chat": {
+      "command": "node",
+      "args": ["./adapters/claude-channel/index.mjs"],
+      "env": {
+        "AGENT_CHAT_DB": "ABSOLUTE_PATH_TO_CHAT.sqlite3",
+        "AGENT_CHAT_BRIDGE": "BRIDGE_ID_FROM_INIT",
+        "AGENT_CHAT_ROOM": "project-room",
+        "AGENT_CHAT_ENDPOINT": "claude.cli.1",
+        "AGENT_CHAT_SYSTEM": "claude"
+      }
+    }
+  }
+}

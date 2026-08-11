@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cross-agent-bridge"
+version = "0.3.0.dev0"
+description = "Persistent local live-session messaging for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Cross-Agent Bridge contributors" }]
+keywords = ["agents", "ai", "sqlite", "ipc", "orchestration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pre-commit==4.6.0",
+  "ruff==0.15.22",
+]
+
+[project.scripts]
+agent-chat = "agent_chat.cli:main"
+agent-chat-codex = "agent_chat.codex_adapter:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+force-exclude = true
+extend-exclude = [
+  "chat.py",
+  "tests/test_chat.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
