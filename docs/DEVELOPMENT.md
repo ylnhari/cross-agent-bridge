@@ -82,10 +82,10 @@ trial and recorded evidence.
 
 ## Intentional legacy exclusions
 
-`chat.py` and `tests/test_chat.py` preserve the frozen schema-2 compatibility
-surface. Ruff excludes them so adopting the formatter cannot create an
-accidental compatibility diff. New code belongs under `src/agent_chat`, with
-tests in the current schema-4 suite.
+`chat.py` and `tests/test_chat.py` preserve the frozen schema 2 (`chat.py`)
+compatibility surface. Ruff excludes them so adopting the formatter cannot
+create an accidental compatibility diff. New code belongs under
+`src/agent_chat`, with tests in the current schema-4 suite.
 
 ## Troubleshooting
 
@@ -98,10 +98,5 @@ tests in the current schema-4 suite.
 
 ## Change expectations
 
-- Keep message content free-form and protocol envelopes minimal.
-- Add deterministic process-boundary tests for adapter changes.
-- Add race, restart, lease, and failure-path coverage for protocol changes.
-- Never commit bridge databases, prompts from real conversations, credentials,
-  machine-specific paths, or private payloads.
-- Follow [CONTRIBUTING.md](../CONTRIBUTING.md) and [SECURITY.md](../SECURITY.md)
-  before proposing publication or security-sensitive changes.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for test-coverage and commit-hygiene
+expectations, and [SECURITY.md](../SECURITY.md) for security-sensitive changes.

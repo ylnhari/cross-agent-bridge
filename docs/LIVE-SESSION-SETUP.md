@@ -8,7 +8,9 @@ progress, clarifications, and final answers without manual copy/paste.
 This guide currently starts Claude Code in an interactive terminal. The Codex
 task is visible in the Codex app. Anthropic's current Channel preview requires a
 per-session CLI opt-in and does not document an equivalent control in the
-Claude Code Desktop UI, so Desktop Code-tab push delivery is not yet claimed.
+Claude Code Desktop UI. Desktop shares MCP configuration, but an MCP connection
+alone does not enable push delivery, so Desktop Code-tab push delivery is not
+yet claimed.
 
 ## 1. Prepare one local bridge
 
@@ -47,15 +49,10 @@ The adapter itself remains outside model turns:
 - active task + inbound message: `turn/steer`;
 - Codex reply/progress tool call: durable message back to the sender.
 
-`--open-app` opens the exact persisted task; it does not make the Windows app a
-second synchronized controller for the adapter's live turn. While an
-adapter-started turn is active, its messages may not appear immediately in the
-app timeline. Typing into that task can start a second concurrent turn in the
-same rollout, making the app foreground the manual turn while the bridge turn
-continues in the background. During active bridge work, send new guidance
-through the orchestrator/bridge. Use the Codex app for task visibility,
-completed history, and native permission handling, or wait until the active
-turn finishes before sending directly in the app.
+`--open-app` opens the exact persisted task; on Windows it is not a second
+synchronized controller for the adapter's live turn — see Troubleshooting,
+"Codex controls tools but its bridge conversation is missing from the app
+timeline."
 
 Natural Codex model-turn completion does not complete a bridge request. The
 root delivery stays pending across as many turns as needed until Codex calls
@@ -71,9 +68,30 @@ If console entry points are not on `PATH`, replace `agent-chat-codex` with
 `python -m agent_chat.codex_adapter` and `agent-chat` with
 `python -m agent_chat` throughout this guide.
 
+An existing adapter-created task can be reattached after a restart:
+
+```powershell
+agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.1 `
+  --thread-id TASK_ID `
+  --open-app
+```
+
 To connect an older Codex task that was not originally created by this adapter,
 use `--thread-id TASK_ID --legacy-cli-bridge` instead of `--create-thread` and
-`--cwd`. Codex app-server cannot add dynamic tools while resuming an existing
+`--cwd`:
+
+```powershell
+agent-chat-codex `
+  --profile $profile `
+  --endpoint codex.app.legacy.1 `
+  --thread-id EXISTING_TASK_ID `
+  --legacy-cli-bridge `
+  --open-app
+```
+
+Codex app-server cannot add dynamic tools while resuming an existing
 task. Compatibility mode therefore injects exact local CLI commands for that
 message's observation, progress, and final reply. The adapter reconciles those
 out-of-process writes with its in-memory delivery state before claim renewal or
@@ -108,9 +126,10 @@ After Claude observes a root, silence triggers three Channel reminders at
 to the original sender while the root remains open.
 
 Reconnect the same native Claude conversation with the same endpoint plus
-`--resume SESSION_ID`. The endpoint lease rejects an accidental second live
-adapter. After a verified crash, wait for the old lease to expire or close the
-old launcher before resuming.
+`--resume SESSION_ID`. Use `--continue` instead only when Claude's most recent
+session in that working directory is definitely the intended one. The endpoint
+lease rejects an accidental second live adapter. After a verified crash, wait
+for the old lease to expire or close the old launcher before resuming.
 
 ## 4. Verify the live pair
 
@@ -132,10 +151,9 @@ agent-chat --profile $profile receive --as probe.1 --wait 60
 ```
 
 For a direct agent-to-agent proof, ask either live agent to call
-`agent_chat_send` to the other endpoint. Replies retain the same
-`conversation_id` automatically. A new-conversation send also takes a stable
-`request_key`: reuse it only for a retry of that intended send, and choose a new
-key for an intentional new conversation.
+`agent_chat_send` to the other endpoint. Retry-key semantics for a
+new-conversation send are a protocol invariant — see
+[docs/PROTOCOL.md](PROTOCOL.md) § Idempotent sends.
 
 ## Many sessions and conversations
 
@@ -155,13 +173,9 @@ conversation; replies and progress inherit the parent's conversation ID. This
 allows several independent conversations between the same pair and several
 senders addressing one busy session at once.
 
-The endpoint lease rejects two live adapters that accidentally reuse one ID.
-After an adapter crash, its lease expires. The next instance takes ownership and
-requeues every claimed request that never received a final reply.
-
-The lease is keyed by `(room, endpoint)`, because each adapter subscribes to one
-room. Do not reuse an endpoint name for another native session in another room,
-and do not attach one native session through multiple adapter processes.
+Lease ownership, crash recovery, and the one-endpoint-per-native-session rule
+are protocol invariants — see [docs/PROTOCOL.md](PROTOCOL.md) § Adapter
+ownership.
 
 ## Long-running work
 
@@ -173,8 +187,8 @@ Agents should:
 4. answer questions arriving under other message IDs;
 5. finish the original request with `agent_chat_reply`.
 
-Progress is deliberately nonterminal. Only a final reply moves the original
-delivery to `replied`.
+Progress-vs-reply semantics are a protocol invariant — see
+[docs/PROTOCOL.md](PROTOCOL.md) § Replies and progress.
 
 ## Troubleshooting
 

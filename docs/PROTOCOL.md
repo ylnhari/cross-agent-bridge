@@ -153,7 +153,8 @@ attention delivery:
   for a new bridge event because the task may legitimately depend on another
   agent or external work. If all three continuations remain unacted, the
   adapter sends the original peer a clearly labelled nonterminal `progress`
-  status and leaves the root open.
+  status, leaves the root open, and emits `continuation_exhausted` to adapter
+  stderr (stderr also records it if the peer notification itself fails).
 
 An older Codex task cannot acquire dynamic tools retroactively. Explicit
 `--legacy-cli-bridge` mode injects locally generated CLI commands containing
@@ -184,13 +185,8 @@ renewal or inbound event handling.
 - Lost adapter lease: stop that adapter; do not continue as an unowned consumer.
 - Transient Codex dispatch error: atomically release that delivery and retry it
   with bounded backoff while the app-server connection remains live.
-- Exhausted Codex unacted continuation budget: leave the root durable and
-  unfinished, send a clearly labelled nonterminal `progress` status to the
-  original sender, and emit `continuation_exhausted` to adapter stderr. If peer
-  notification itself fails, stderr records that failure. Never synthesize a
-  final reply.
-- Exhausted Claude unacted reminder budget: use the same durable nonterminal
-  peer status and leave the root open; never synthesize a final reply.
+- Exhausted Codex unacted continuation budget: see Host adapters — Codex.
+- Exhausted Claude unacted reminder budget: see Host adapters — Claude.
 - Empty bounded receive: JSON `status=empty`, exit code 3.
 - Invalid receipt, membership, reply, kind, retry, or lease: JSON error on
   stderr, exit code 2.
@@ -201,10 +197,12 @@ transaction so concurrent initializers converge on one complete database.
 
 ## Compatibility and migration
 
-Schema changes are gated. Pre-release schema 1 through 3 databases are not
-silently altered; create a new schema-4 database and export only intentionally
-reviewed, non-sensitive messages if migration is needed. The unrelated frozen
-`chat.py` two-agent format remains usable only through that legacy script.
+Schema changes are gated. Legacy `chat.py` wrote schema 2, and schemas 1
+through 3 were pre-release states of the same evolving prototype; the current
+packaged schema (4) refuses all of them rather than migrating implicitly. If
+migration is needed, create a new schema-4 database and export only
+intentionally reviewed, non-sensitive messages. The unrelated frozen `chat.py`
+two-agent format remains usable only through that legacy script.
 
 ## Deployment boundary
 

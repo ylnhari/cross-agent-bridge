@@ -38,8 +38,8 @@ or when they belong to the same system. Leaving stops future sends to that
 member but does not delete deliveries already queued for it.
 
 `members` reports adapter type, host reference, lease expiry, and
-`adapter_online`. That flag proves a host adapter is renewing its lease; it does
-not prove the model is currently generating.
+`adapter_online` — lease liveness, not proof the model is generating (see
+[docs/PROTOCOL.md](docs/PROTOCOL.md) § Adapter ownership).
 
 ## Live-session launchers
 
@@ -79,8 +79,8 @@ Options:
   `message`; linked sends default to final `reply`.
 - `--key CLIENT_MESSAGE_ID` makes a retry idempotent for that sender and room.
 
-The same retry key may be reused only with identical text, kind, reply target,
-audience, and recipients.
+A reused retry key must match its original envelope exactly, or the send is
+rejected (see [docs/PROTOCOL.md](docs/PROTOCOL.md) § Idempotent sends).
 
 Each recipient may commit one distinct final reply to a delivered root. An
 identical retry returns the original reply; a conflicting second final reply is

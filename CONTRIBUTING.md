@@ -44,6 +44,8 @@ Keep changes focused. Describe the invariant being changed, tests run, and any
 compatibility or security effect. Schema changes require a bumped schema version
 and an explicit migration or an intentional fail-closed decision.
 
+Before any publication or push, inspect the exact diff and scan tracked files
+for secrets, machine paths, runtime databases, and conversation payloads.
 Do not publish packages, create a public release, or push this pre-release
 checkout solely because local checks pass. Publication requires an explicit
 owner decision and an independent cross-system review.
